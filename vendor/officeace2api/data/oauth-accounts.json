@@ -1,0 +1,33 @@
+{
+  "01a1496da354727da118d3a038300ab7:01a1496da35476d28e89adf188becc5a": {
+    "id": "01a1496da354727da118d3a038300ab7:01a1496da35476d28e89adf188becc5a",
+    "label": "账号 01a1496d",
+    "accountId": "01a1496da354727da118d3a038300ab7",
+    "userId": "01a1496da35476d28e89adf188becc5a",
+    "userName": "",
+    "baseUrl": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+    "authorization": "Basic NjIwNjQ4N2ZjNzlkNDg0NTk4ZWYzMjY2ODcwY2I5NGI6MDU4NzA3OWM4OWQyNGQ2NWFlYjY1NDk4NjkyZGNjZjA=",
+    "createdAt": 1793727125629,
+    "credential": {
+      "accessKeyId": "HSTALBQOQ40V86KZLHUQ",
+      "secretAccessKey": "9s9XBpGfCkpWsCFV6kHYrABRTohyJrqCQaskyieU",
+      "securityToken": "hQpjbi1ub3J0aC00AQAABZNIU1RBTEJRT1E0MFY4NktaTEhVUTcm1x_LSoMwPP-1sLo3ojgv8XCxKBJsGdfUvqghQ3LdE9geybQbI2D9K1xOOY8TkFclL3nvcrsOabaLoHoua_IkmOhLmzwJNzZjTPlCql7sQJNxU4FnjZkM2fgzpqQ856SnKAU-ET_wRmWs-XN45HLwSSrYt3vkdMswF7oFWjOpiODsLv-I--f11PDNfw1mWrCNs4VJHMywOTZNXrcdyFnxOJYGuMtkDwBmjVg-C_rWAJEgWEl5zhD0MvaxBD9jeTW0c7R1C4BpXKhfRuUKlx5QsMFFmv2K_GLG1SkS4w41X-WUr63ABDx6DXpaVs96OugSK4-ZqfyzMVI0RC4i2UxRgx-EEh6w9sgBU37tszCD35CeaeCSmfeRAK-918Vr36tkmpc50Eg3zkm9MKJscqyI6ApmHLQVpnfeQkFRAFw_Ev5FbduWWzm1T82wTZGqQI-a5z4dBmI7zerDcfdronAkEe5HV9GyYMsdIeSNHI_RYYY8wr4twvJy6w==",
+      "projectId": "",
+      "expiresAt": "2026-11-03T19:32:04.413Z"
+    },
+    "refreshToken": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6ImNuLW5vcnRoLTQ6NiJ9.eyJleHAiOjE3OTYzMTkxMjQsImlhdCI6MTc5MzcyNzEyNCwiaXNzIjoiY24tbm9ydGgtNCIsInR5cGUiOiJyZWZyZXNoVG9rZW4iLCJ1c2VyX3Byb2ZpbGUiOiJleUpoWTJOdmRXNTBYMmxrSWpvaU1ERmhNVFE1Tm1SaE16VTBOekkzWkdFeE1UaGtNMkV3TXpnek1EQmhZamNpTENKaFkyTnZkVzUwWDI1aGJXVWlPaUpvZHpBNE5UZzVOVE0yTXlJc0ltWmxZWFIxY21WelgzTjNhWFJqYUdWeklqcDdJbVZ1WVdKc1pWOXdaSEExSWpwMGNuVmxmU3dpY0hKcGJtTnBjR0ZzWDJsa0lqb2lNREZoTVRRNU5tUmhNelUwTnpaa01qaGxPRGxoWkdZeE9EaGlaV05qTldFaUxDSndjbWx1WTJsd1lXeGZhWE5mY205dmRGOTFjMlZ5SWpwMGNuVmxMQ0p3Y21sdVkybHdZV3hmZFhKdUlqb2lhV0Z0T2pvd01XRXhORGsyWkdFek5UUTNNamRrWVRFeE9HUXpZVEF6T0RNd01HRmlOenAxYzJWeU9taDNNRGcxT0RrMU16WXpJbjA9IiwiY2xpZW50X2lkIjoicGRwNV9mb3JfYWdlbnRhcnRzIiwiY25mIjp7ImprdCI6IlJ0OUVRR0M2UEczdTM0UkdBZ19WeFZRNFYxdmxHMnpfQXVJWVFjRnA2aEUifSwianRpIjoiMDU4ZjgwOWUtZTc5ZS00Nzk5LThhNWUtZTc5ZmEwODZlNDFhIiwiZmVkZXJhdGlvbiI6bnVsbH0.AXDVTsYY-eK9a4x5gbONc48Au0rnESdfXl3YYjcXOwurQHqVHSn5PpjctpL3vZBmyCuXDffoGnn2zdUDPEpPAKgQt3rC3UJHJlCxFX16TFxYnJu5fNCisIcBgMZeHV3gs5MDlH30cmx5shI8GT3nEfgo5GnHMmrPj0jbep9I7vcLGBvA-qIzmwfz8GmgQhopQaEwSrJCNKESprV18MTSmIe09lyPtkynRLkztp1CKIwXY6N4Jm_8IUA5r4OziIi9VbCwfSfie7yBmY2kEDXXjALX98lXRpokJQBnrE83qsBP6URRh6mThUkTPZaVTXw0WjgxH-7oG5uuybl0Za8tvA",
+    "dpopPrivateJwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "hs1cvvFD1eB1T5EQIy7UN-Gt7Kj9NfqapHn250r6WwY",
+      "y": "8L6IYU1BgTEJYWrkwdumVmR_FLbpw_WI0aAh65Qlmfs",
+      "d": "6aXQooTsNNrjqmk8jZIf4KjFQPdPoPndiA9Yyk6CRGI"
+    },
+    "dpopPublicJwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "hs1cvvFD1eB1T5EQIy7UN-Gt7Kj9NfqapHn250r6WwY",
+      "y": "8L6IYU1BgTEJYWrkwdumVmR_FLbpw_WI0aAh65Qlmfs"
+    }
+  }
+}

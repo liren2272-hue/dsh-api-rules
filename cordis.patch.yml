@@ -1,0 +1,454 @@
+# 规则前置层：DSH 启动时即监听回环端口，按规则包转发到各上游 API。
+#
+# 新增一个 API 只需要在 routes 里加一条：id / rules，规则包名可复用
+# （codearts、generic、cline、raccoon）也可由别的插件通过 registry.register() 注入。
+# 需要「自己签名」的 API 用 signer 指定一个签名器（目前内置 huawei），
+# 由本插件直接对上游做签名/模型发现，不再依赖任何外部网关进程。
+# 需要「本机先拉起一个独立进程」的 API 在路由上写 launch（如 cline2api、raccoon2api 所在的
+# CLIProxyAPI），插件启动时会自动拉起它，进程退出时自动回收。
+- insert:
+    - id: llm-api-rules
+      name: '@local/dsh-api-rules'
+      config:
+        port: 8788
+        routes:
+          # 码道：DSH -> 8788（本插件，规则 + 自带网关签名）-> 华为云上游。
+          # signer: huawei 表示由本插件直接对华为云做 SDK-HMAC-SHA256 签名与模型发现，
+          # AK/SK 由「Codearts账号」设置卡片填入，存于本插件隔离的文件存储。
+          - id: codearts
+            default: true
+            signer: huawei
+            rules:
+              - codearts
+            concurrency: 3
+            sessionHoldMs: 60000
+            # 上游探测失败时 /v1/models 的回落清单，同时给规则 1/3 提供元数据。
+            # 没写 supportsImages 的模型按纯文本处理（规则 3 的保守方向）。
+            models:
+              - id: GLM-5.2
+                maxTokens: 65536
+              - id: glm-5.2-sft-harmony
+                maxTokens: 131072
+              - id: openpangu-2.0-pro
+                maxTokens: 131072
+              - id: openpangu-2.0-flash
+                maxTokens: 131072
+              - id: glm-5.3
+                maxTokens: 65536
+              - id: deepseek-v4.1-flash
+                maxTokens: 65536
+              - id: kimi-k3
+                maxTokens: 65536
+          # 果办 (OfficeAce)：DSH -> 8788（本插件，回环转发 + 参数规则）-> 本插件自带的
+          # officeace2api :7864（源码内嵌在 vendor/officeace2api/）。
+          #
+          # 「跳转页」形态：账号与登录全部由 officeace2api 负责，本插件只做转发，
+          # 设置卡片上不出现任何密钥输入框，只给一个「打开管理面板」入口。
+          # 面板要口令（内嵌副本的 config.json -> admin.token），所以 adminUrl 直接
+          # 带上 ?token=，点开即可进，不用再手输一次。
+          #
+          # 与 cline / raccoon 的差别只是「进程从哪来」：它们拉起的是机器上单独安装的
+          # exe，这里拉起的是**本插件目录里的源码副本**——所以插件之外没有任何需要
+          # 保留的文件夹，误删外部目录也不会再让 OfficeAce 失联。加账号仍走面板
+          # 「号池 → 换个账号登录」，登录完自动入库，不需要 OfficeAce 桌面端。
+          #
+          # 注：这里**不写 credentialed**。写它等于让本插件自己存「网关地址 + Authorization」
+          # 去直连上游，那是另一种部署形态，与「跳转页」诉求相反（该路径的代码仍在，
+          # 由 test/credentialed-endpoint.test.mjs 覆盖）。
+          - id: officeace
+            upstream: "http://127.0.0.1:7864/v1"
+            apiKey: "sk-officeace"
+            adminUrl: "http://127.0.0.1:7864/admin?token=officeace-local-admin"
+            # 已经跑着的实例绝不重复拉起；只在没人监听 7864 时才用内嵌副本起一个。
+            # 健康端点在站点根（/healthz），不在 upstream 之后，所以用 readyUrl。
+            launch:
+              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
+              args:
+                - "src/index.mjs"
+              # config.json 按 process.cwd() 解析，必须把 cwd 指到内嵌副本根目录。
+              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\officeace2api"
+              readyUrl: "http://127.0.0.1:7864/healthz"
+              readyTimeoutMs: 30000
+              readyPollMs: 500
+              killOnStop: true
+            rules:
+              - generic
+            concurrency: 4
+            sessionHoldMs: 60000
+            # 模型清单（实测自本机 officeace2api :7864 /v1/models；仓库文档里的
+            # officeace-llm-* 命名已废弃，当前真实 id 见下）。7864 在线时这些即
+            # 可直接拉取；离线时作为回显示项。
+            models:
+              - id: deepseek-v4-flash
+                maxTokens: 65536
+              - id: deepseek-v4-flash-0731
+                maxTokens: 65536
+              - id: deepseek-v4.1-flash
+                maxTokens: 65536
+              - id: deepseek-v4.1-flash-0930
+                maxTokens: 65536
+              - id: glm-5.1
+                maxTokens: 65536
+              - id: glm-5.2
+                maxTokens: 65536
+              - id: glm-5.2-zx
+                maxTokens: 65536
+              - id: glm-5.3
+                maxTokens: 65536
+              - id: glm-5.3-zx
+                maxTokens: 65536
+              - id: kimi-k2.6
+                maxTokens: 65536
+              - id: kimi-k3
+                maxTokens: 65536
+              - id: qwen3-30b-a3b
+                maxTokens: 65536
+              - id: qwen3-32b
+                maxTokens: 65536
+          # cline（cline2api）：DSH -> 8788（本插件，规则 + 启动期自动拉起）-> cline2api :3457。
+          #
+          # cline2api 默认端口 3457；数据目录默认 ~/.dsh/cline2api。本路由通过 launch 在插件
+          # 启动时把它拉起来（已运行时绝不重复拉起），无需用户手动开进程。上游 API Key 接受
+          # 任意值（cline2api 在未配 key 时直接放行），所以这里 apiKey 用占位串即可。
+          #
+          # 这条路由不走 credentialed：上游地址固定为本地 :3457，且无需用户填任何网关凭据，
+          # 因此设置卡片对它只展示「由插件自动拉起」的说明，不出现 endpoint 表单。
+          #
+          # 注：cline2api 的 /v1/models 返回的是它自身同步的模型（含 cline-free/*、cline-pass/*、
+          # anthropic/* 等 26 个），与下面手写的回显示项可能不完全一致；3457 在线时以它为准，
+          # 离线时下面这些条目仍是可用的回退选择。
+          - id: cline
+            upstream: "http://127.0.0.1:3457/v1"
+            apiKey: "sk-cline"
+            # 设置卡片上的「打开登录面板」按钮指向 cline2api 的管理后台（无鉴权），
+            # 用户可在里面加 Cline 账号，从而解锁 cline-pass/* 等需要账号的模型。
+            adminUrl: "http://127.0.0.1:3457/admin"
+            rules:
+              - cline
+            concurrency: 6
+            sessionHoldMs: 60000
+            launch:
+              command: "C:\\Users\\15940\\.dsh\\cline2api\\cline-proxy.exe"
+              args:
+                - "-port"
+                - "3457"
+              readyPath: "/health"
+              readyTimeoutMs: 20000
+              readyPollMs: 500
+              killOnStop: true
+            models:
+              - id: cline-free/solar-mini4
+                maxTokens: 65536
+              - id: cline-pass/deepseek-v4.1-flash
+                maxTokens: 65536
+              - id: cline-pass/deepseek-v4.1-flash-1017
+                maxTokens: 65536
+              - id: cline-pass/kimi-k3
+                maxTokens: 65536
+              - id: cline-pass/glm-5.3
+                maxTokens: 65536
+              - id: cline-pass/qwen3.7-max
+                maxTokens: 65536
+              - id: cline-pass/qwen3.7-plus
+                maxTokens: 65536
+              - id: cline-pass/minimax-m3
+                maxTokens: 65536
+              - id: anthropic/claude-sonnet-5.5
+                maxTokens: 65536
+              - id: anthropic/claude-opus-5.5
+                maxTokens: 65536
+              - id: google/gemini-4-argon
+                maxTokens: 65536
+              - id: openai/gpt-6-astra
+                maxTokens: 65536
+              - id: openai/gpt-6.1-sol
+                maxTokens: 65536
+              - id: moonshotai/kimi-k3
+                maxTokens: 65536
+
+          # 小浣熊 (raccoon2api)：DSH -> 8788（本插件，回环转发 + 参数规则）-> CPA :8317。
+          #
+          # raccoon2api 不是独立服务，而是 CLIProxyAPI（CPA）的 Go 动态库插件：CPA 在本机
+          # 监听 8317 并加载 plugins/windows/amd64/raccoon2api.dll，把自己伪装成「小浣熊
+          # 桌面客户端」去请求上游 xiaohuanxiong.com。所以这里和 cline 同构：
+          #   - 本插件不收集任何凭据（credentialKind=managed），只做转发与请求整形；
+          #   - 账号与登录全部在 CPA 的 raccoon2api 控制台里完成；
+          #   - `launch` 负责在 DSH 启动时把 CPA 本体拉起来。
+          #
+          # 模型 id 一律带 `raccoon/` 前缀（CPA 侧剥前缀再请求上游）。下面是 9 个
+          # 全部模型，取自 CPA 的 /v1/models 与 /v0/management/raccoon2api/models
+          # （后者带 ContextLength / MaxCompletionTokens / SupportedInputModalities）。
+          #
+          # 注意：这里的 models 只影响两件事 —— 上游离线时 /raccoon/v1/models 的回落
+          # 清单，以及给规则包提供 maxTokens/supportsImages 元数据。**模型选择器里显示
+          # 哪些模型由下面 llm-pi-ai 那段决定**，llm-pi-ai 不会去问上游要清单，
+          # 增删模型时两处必须一起改，否则就会出现「控制台 9 个、选择器 4 个」。
+          - id: raccoon
+            upstream: "http://127.0.0.1:8317/v1"
+            apiKey: "sk-raccoon"
+            # 控制台页面本身不需要密钥（数据请求才要，密钥存 localStorage），
+            # 所以这里给裸地址即可——这是跳转入口，不是登录凭证。
+            adminUrl: "http://127.0.0.1:8317/v0/resource/plugins/raccoon2api/console"
+            rules:
+              - raccoon
+            concurrency: 4
+            sessionHoldMs: 60000
+            launch:
+              command: "C:\\Users\\15940\\.dsh\\cpa\\cli-proxy-api.exe"
+              args:
+                - "-config"
+                - "C:\\Users\\15940\\.dsh\\cpa\\config.yaml"
+              cwd: "C:\\Users\\15940\\.dsh\\cpa"
+              # CPA 没有 /health 路由（实测 404）；/v1/models 无鉴权头时回 401，
+              # 但启动探活只要求「收到 HTTP 响应」，401 同样证明进程已在监听。
+              readyPath: "/v1/models"
+              readyTimeoutMs: 30000
+              readyPollMs: 500
+              killOnStop: true
+            models:
+              - id: raccoon/raccoon-19b265
+                name: Raccoon-Work-260817-A
+                contextWindow: 1000000
+                maxTokens: 100000
+              - id: raccoon/raccoon-405a1c
+                name: Raccoon-Work-260817-B
+                contextWindow: 1000000
+                maxTokens: 100000
+              - id: raccoon/raccoon-8c4485
+                name: Raccoon-Work
+                contextWindow: 1000000
+                maxTokens: 100000
+              - id: raccoon/sn-deepseek-v4-1-flash-1017
+                name: DeepSeek-V4.1-Flash-1017
+                contextWindow: 1000000
+                maxTokens: 100000
+              - id: raccoon/sn-glm-5-3
+                name: GLM-5-3
+                contextWindow: 1000000
+                maxTokens: 100000
+              - id: raccoon/sn-glm-5-3-flash
+                name: GLM-5-3-Flash
+                contextWindow: 1000000
+                maxTokens: 100000
+              - id: raccoon/sn-kimi-k3
+                name: Kimi-K3
+                contextWindow: 1000000
+                maxTokens: 100000
+              - id: raccoon/sn-sensenova-6-8-flash
+                name: SenseNova-6.8-Flash
+                contextWindow: 256000
+                maxTokens: 63999
+              - id: raccoon/sn-sensenova-6-8-flash-lite
+                name: SenseNova-6.8-Flash-Lite
+                contextWindow: 256000
+                maxTokens: 63999
+
+# ---------------------------------------------------------------------------
+# DSH 侧的 provider 注册 —— 与上面同一个插件，跟随插件一起安装。
+#
+# 上面那段只提供 8788 上的规则层；下面这段把同一批 API 注册进 llm-pi-ai，
+# 模型选择器里才会直接出现 codearts / officeace。这样换机器时只要装本插件，
+# 就不必再手工改 profile 的 cordis.patch.yml。
+#
+# apiKeyEnv: API_RULES_BEARER —— 这是一条**占位** bearer（不是秘密）：pi-ai 只
+# 用它确认「引用已配置」，真正的上游鉴权由本插件按路由注入。插件装载时会经
+# lib/seed.mjs 自举写入这条引用（**只在缺失时写**，已有的值不动），所以新机器
+# 装完插件就能直接用，不必手工编辑 .credentials.yaml。
+#
+# 补丁语义（见 dsh-base/cordis.patch.yml 头注释）：补丁按 id 定位整行、
+# 「整块替换 config」而非深合并，后一层覆盖前一层。本插件在 bundles 里排在
+# dsh-base 之后，所以这里改得到 llm-pi-ai；但用户 profile 的 cordis.patch.yml
+# 又在所有 bundle 之后 —— 若某台机器的 profile 里已经有 `- id: llm-pi-ai`
+# 并且写了 providers，则以 profile 那份为准，需要把下面两条 provider 也补进
+# profile（本机 profile 已包含）。
+# ---------------------------------------------------------------------------
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      codearts:
+        apiKeyEnv: API_RULES_BEARER
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/v1
+        models:
+          - id: GLM-5.2
+            name: GLM-5.2
+            maxTokens: 65536
+          - id: glm-5.2-sft-harmony
+            name: GLM-5.2-SFT-Harmony
+            maxTokens: 131072
+          - id: openpangu-2.0-pro
+            name: OpenPangu-2.0-Pro
+            maxTokens: 131072
+          - id: openpangu-2.0-flash
+            name: OpenPangu-2.0-Flash
+            maxTokens: 131072
+          - id: glm-5.3
+            name: GLM-5.3
+            maxTokens: 65536
+          - id: deepseek-v4.1-flash
+            name: DeepSeek-V4.1-Flash
+            maxTokens: 65536
+          - id: kimi-k3
+            name: Kimi-K3
+            maxTokens: 65536
+      officeace:
+        apiKeyEnv: API_RULES_BEARER
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/officeace/v1
+        models:
+          - id: deepseek-v4-flash
+            name: DeepSeek-V4-Flash
+            maxTokens: 65536
+          - id: deepseek-v4-flash-0731
+            name: DeepSeek-V4-Flash-0731
+            maxTokens: 65536
+          - id: deepseek-v4.1-flash
+            name: DeepSeek-V4.1-Flash
+            maxTokens: 65536
+          - id: deepseek-v4.1-flash-0930
+            name: DeepSeek-V4.1-Flash-0930
+            maxTokens: 65536
+          - id: glm-5.1
+            name: GLM-5.1
+            maxTokens: 65536
+          - id: glm-5.2
+            name: GLM-5.2
+            maxTokens: 65536
+          - id: glm-5.2-zx
+            name: GLM-5.2-ZX
+            maxTokens: 65536
+          - id: glm-5.3
+            name: GLM-5.3
+            maxTokens: 65536
+          - id: glm-5.3-zx
+            name: GLM-5.3-ZX
+            maxTokens: 65536
+          - id: kimi-k2.6
+            name: Kimi-K2.6
+            maxTokens: 65536
+          - id: kimi-k3
+            name: Kimi-K3
+            maxTokens: 65536
+          - id: qwen3-30b-a3b
+            name: Qwen3-30B-A3B
+            maxTokens: 65536
+          - id: qwen3-32b
+            name: Qwen3-32B
+            maxTokens: 65536
+      # cline（cline2api）：baseURL 指向本插件 8788 上的 /cline/v1 路由，
+      # 该路由在插件启动时自动拉起 cline2api（默认 :3457）。模型以 cline2api 实时同步的
+      # 清单为准；下面这些是常用回退条目。apiKeyEnv 同样是占位 bearer（见上方头注释）。
+      cline:
+        apiKeyEnv: API_RULES_BEARER
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/cline/v1
+        models:
+          - id: cline-free/solar-mini4
+            name: Cline Free Solar Mini 4
+            maxTokens: 65536
+          - id: cline-pass/deepseek-v4.1-flash
+            name: Cline DeepSeek V4.1 Flash
+            maxTokens: 65536
+          - id: cline-pass/deepseek-v4.1-flash-1017
+            name: Cline DeepSeek V4.1 Flash 1017
+            maxTokens: 65536
+          - id: cline-pass/kimi-k3
+            name: Cline Kimi K3
+            maxTokens: 65536
+          - id: cline-pass/glm-5.3
+            name: Cline GLM-5.3
+            maxTokens: 65536
+          - id: cline-pass/qwen3.7-max
+            name: Cline Qwen3.7 Max
+            maxTokens: 65536
+          - id: cline-pass/qwen3.7-plus
+            name: Cline Qwen3.7 Plus
+            maxTokens: 65536
+          - id: cline-pass/minimax-m3
+            name: Cline MiniMax M3
+            maxTokens: 65536
+          - id: anthropic/claude-sonnet-5.5
+            name: Claude Sonnet 5.5
+            maxTokens: 65536
+          - id: anthropic/claude-opus-5.5
+            name: Claude Opus 5.5
+            maxTokens: 65536
+          - id: google/gemini-4-argon
+            name: Gemini 4 Argon
+            maxTokens: 65536
+          - id: openai/gpt-6-astra
+            name: GPT-6 Astra
+            maxTokens: 65536
+          - id: openai/gpt-6.1-sol
+            name: GPT-6.1 Sol
+            maxTokens: 65536
+          - id: moonshotai/kimi-k3
+            name: Moonshot Kimi K3
+            maxTokens: 65536
+      # raccoon（raccoon2api）：baseURL 指向本插件 8788 上的 /raccoon/v1 路由，
+      # 该路由在插件启动时自动拉起 CLIProxyAPI（默认 :8317）。模型 id 带 `raccoon/` 前缀。
+      #
+      # 这里是**模型选择器显示哪些模型**的唯一来源：llm-pi-ai 不会向上游查询清单，
+      # 只展示这段里声明过的条目（上游 REST 里多出来的模型不会自动出现）。
+      # 9 条与 CPA 的 /v0/management/raccoon2api/models 一一对应，name 用上游
+      # DisplayName，contextWindow / maxTokens 用 ContextLength / MaxCompletionTokens。
+      raccoon:
+        apiKeyEnv: API_RULES_BEARER
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/raccoon/v1
+        models:
+          - id: raccoon/raccoon-19b265
+            name: Raccoon-Work-260817-A
+            contextWindow: 1000000
+            maxTokens: 100000
+          - id: raccoon/raccoon-405a1c
+            name: Raccoon-Work-260817-B
+            contextWindow: 1000000
+            maxTokens: 100000
+          - id: raccoon/raccoon-8c4485
+            name: Raccoon-Work
+            contextWindow: 1000000
+            maxTokens: 100000
+            input:
+              - text
+              - image
+          - id: raccoon/sn-deepseek-v4-1-flash-1017
+            name: DeepSeek-V4.1-Flash-1017
+            contextWindow: 1000000
+            maxTokens: 100000
+            input:
+              - text
+              - image
+          - id: raccoon/sn-glm-5-3
+            name: GLM-5-3
+            contextWindow: 1000000
+            maxTokens: 100000
+          - id: raccoon/sn-glm-5-3-flash
+            name: GLM-5-3-Flash
+            contextWindow: 1000000
+            maxTokens: 100000
+            input:
+              - text
+              - image
+          - id: raccoon/sn-kimi-k3
+            name: Kimi-K3
+            contextWindow: 1000000
+            maxTokens: 100000
+            input:
+              - text
+              - image
+          - id: raccoon/sn-sensenova-6-8-flash
+            name: SenseNova-6.8-Flash
+            contextWindow: 256000
+            maxTokens: 63999
+            input:
+              - text
+              - image
+          - id: raccoon/sn-sensenova-6-8-flash-lite
+            name: SenseNova-6.8-Flash-Lite
+            contextWindow: 256000
+            maxTokens: 63999
+            input:
+              - text
+              - image

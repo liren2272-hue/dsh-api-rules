@@ -1,0 +1,195 @@
+{
+  "lastProbeAt": 1793728700202,
+  "probedWithCredentials": "01a1496da354727da118d3a038300ab7:01a1496da35476d28e89adf188becc5a",
+  "unavailable": [
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash-bnt",
+    "deepseek-v4.1-flash-qianfan",
+    "glm-5.2-a3",
+    "glm-5.2-harmony",
+    "glm-5.3-test",
+    "glm.5.2-arkts-spark",
+    "kimi-k3-1019",
+    "kimi-k3-test-1009",
+    "kimi-k3.1-pro",
+    "openpangu-2.0-flash",
+    "openpangu-2.0-pro"
+  ],
+  "results": {
+    "deepseek-v4-pro": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728686202,
+      "ms": 129
+    },
+    "deepseek-v4.1-flash": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728686661,
+      "ms": 588
+    },
+    "deepseek-v4.1-flash-0930": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728686677,
+      "ms": 475
+    },
+    "deepseek-v4.1-flash-bnt": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728686747,
+      "ms": 70
+    },
+    "deepseek-v4.1-flash-qianfan": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728686811,
+      "ms": 64
+    },
+    "deepseek-v4.1-flash-1017": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728687260,
+      "ms": 599
+    },
+    "deepseek-v4-flash-0731": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728687461,
+      "ms": 1389
+    },
+    "glm-5.2-a3": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728687519,
+      "ms": 58
+    },
+    "glm-5.2-harmony": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728687582,
+      "ms": 62
+    },
+    "glm-5.3": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728688513,
+      "ms": 931
+    },
+    "deepseek-v4-flash": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728688631,
+      "ms": 2561
+    },
+    "glm-5.3-test": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728688696,
+      "ms": 65
+    },
+    "glm.5.2-arkts-spark": {
+      "ok": false,
+      "status": 403,
+      "code": "ModelArts.81004",
+      "at": 1793728688758,
+      "ms": 62
+    },
+    "glm-5.3-flash": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728689490,
+      "ms": 976
+    },
+    "kimi-k3": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728691523,
+      "ms": 2033
+    },
+    "kimi-k3-1019": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728691583,
+      "ms": 60
+    },
+    "kimi-k3-test-1009": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728691643,
+      "ms": 60
+    },
+    "kimi-k3.1-pro": {
+      "ok": false,
+      "status": 404,
+      "code": "ModelArts.81009",
+      "at": 1793728691699,
+      "ms": 56
+    },
+    "openpangu-2.0-flash": {
+      "ok": false,
+      "status": 403,
+      "code": "ModelArts.81004",
+      "at": 1793728691764,
+      "ms": 65
+    },
+    "openpangu-2.0-pro": {
+      "ok": false,
+      "status": 403,
+      "code": "ModelArts.81004",
+      "at": 1793728691820,
+      "ms": 56
+    },
+    "qwen3-30b-a3b": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728692014,
+      "ms": 194
+    },
+    "qwen3-32b": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728692249,
+      "ms": 235
+    },
+    "glm-5.2": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728696138,
+      "ms": 8878
+    },
+    "kimi-k2.6": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728696818,
+      "ms": 8060
+    },
+    "glm-5.1": {
+      "ok": true,
+      "status": 200,
+      "code": "",
+      "at": 1793728700202,
+      "ms": 13391
+    }
+  }
+}

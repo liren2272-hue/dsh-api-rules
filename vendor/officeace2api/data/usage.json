@@ -1,0 +1,541 @@
+{
+  "since": "2026-11-03T17:57:51.033Z",
+  "totals": {
+    "requests": 25,
+    "ok": 13,
+    "failed": 12,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  },
+  "byModel": {
+    "deepseek-v4-pro": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 129
+    },
+    "deepseek-v4.1-flash": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 588
+    },
+    "deepseek-v4.1-flash-0930": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 475
+    },
+    "deepseek-v4.1-flash-bnt": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 70
+    },
+    "deepseek-v4.1-flash-qianfan": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 64
+    },
+    "deepseek-v4.1-flash-1017": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 599
+    },
+    "deepseek-v4-flash-0731": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 1389
+    },
+    "glm-5.2-a3": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 58
+    },
+    "glm-5.2-harmony": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 62
+    },
+    "glm-5.3": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 931
+    },
+    "deepseek-v4-flash": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 2561
+    },
+    "glm-5.3-test": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 65
+    },
+    "glm.5.2-arkts-spark": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 62
+    },
+    "glm-5.3-flash": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 976
+    },
+    "kimi-k3": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 2033
+    },
+    "kimi-k3-1019": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 60
+    },
+    "kimi-k3-test-1009": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 60
+    },
+    "kimi-k3.1-pro": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 56
+    },
+    "openpangu-2.0-flash": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 65
+    },
+    "openpangu-2.0-pro": {
+      "requests": 1,
+      "ok": 0,
+      "failed": 1,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 56
+    },
+    "qwen3-30b-a3b": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 194
+    },
+    "qwen3-32b": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 235
+    },
+    "glm-5.2": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 8878
+    },
+    "kimi-k2.6": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 8060
+    },
+    "glm-5.1": {
+      "requests": 1,
+      "ok": 1,
+      "failed": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "avgLatencyMs": 13391
+    }
+  },
+  "byApiKey": {},
+  "recent": [
+    {
+      "ts": "2026-11-03T17:58:20.202Z",
+      "model": "glm-5.1",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 13391,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:16.818Z",
+      "model": "kimi-k2.6",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 8060,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:16.138Z",
+      "model": "glm-5.2",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 8878,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:12.249Z",
+      "model": "qwen3-32b",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 235,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:12.014Z",
+      "model": "qwen3-30b-a3b",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 194,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:11.820Z",
+      "model": "openpangu-2.0-pro",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 56,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81004"
+    },
+    {
+      "ts": "2026-11-03T17:58:11.764Z",
+      "model": "openpangu-2.0-flash",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 65,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81004"
+    },
+    {
+      "ts": "2026-11-03T17:58:11.699Z",
+      "model": "kimi-k3.1-pro",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 56,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    },
+    {
+      "ts": "2026-11-03T17:58:11.643Z",
+      "model": "kimi-k3-test-1009",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 60,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    },
+    {
+      "ts": "2026-11-03T17:58:11.583Z",
+      "model": "kimi-k3-1019",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 60,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    },
+    {
+      "ts": "2026-11-03T17:58:11.523Z",
+      "model": "kimi-k3",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 2033,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:09.490Z",
+      "model": "glm-5.3-flash",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 976,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:08.758Z",
+      "model": "glm.5.2-arkts-spark",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 62,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81004"
+    },
+    {
+      "ts": "2026-11-03T17:58:08.696Z",
+      "model": "glm-5.3-test",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 65,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    },
+    {
+      "ts": "2026-11-03T17:58:08.631Z",
+      "model": "deepseek-v4-flash",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 2561,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:08.513Z",
+      "model": "glm-5.3",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 931,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:07.582Z",
+      "model": "glm-5.2-harmony",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 62,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    },
+    {
+      "ts": "2026-11-03T17:58:07.519Z",
+      "model": "glm-5.2-a3",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 58,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    },
+    {
+      "ts": "2026-11-03T17:58:07.461Z",
+      "model": "deepseek-v4-flash-0731",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 1389,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:07.260Z",
+      "model": "deepseek-v4.1-flash-1017",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 599,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:06.811Z",
+      "model": "deepseek-v4.1-flash-qianfan",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 64,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    },
+    {
+      "ts": "2026-11-03T17:58:06.747Z",
+      "model": "deepseek-v4.1-flash-bnt",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 70,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    },
+    {
+      "ts": "2026-11-03T17:58:06.677Z",
+      "model": "deepseek-v4.1-flash-0930",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 475,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:06.661Z",
+      "model": "deepseek-v4.1-flash",
+      "ok": true,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 588,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": ""
+    },
+    {
+      "ts": "2026-11-03T17:58:06.202Z",
+      "model": "deepseek-v4-pro",
+      "ok": false,
+      "stream": false,
+      "endpoint": "/admin/api/models/probe",
+      "latencyMs": 129,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "credential": "https://modelgw-0009.officeace.cn-southwest-2.huaweicloud-agentarts.com/v2",
+      "error": "ModelArts.81009"
+    }
+  ]
+}
