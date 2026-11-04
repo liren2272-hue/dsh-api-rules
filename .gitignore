@@ -4,3 +4,13 @@ node_modules/
 Thumbs.db
 *.swp
 *.bak
+# 内嵌 loomy2api：按 officeace2api 的先例平铺纳入版本库（源码随插件分发，
+# 拉起用的 .venv/ 源码副本才不会在全新 clone 后失联）。其上游 .git 已移出，
+# 运行时产物（虚拟环境 / 日志 / 生成的 config 与账号）一律忽略。
+vendor/loomy2api/.venv/
+vendor/loomy2api/logs/
+vendor/loomy2api/logs-smoke/
+vendor/loomy2api/logs-test/
+vendor/loomy2api/config.json
+vendor/loomy2api/accounts.json
+vendor/loomy2api/accounts-test.json
