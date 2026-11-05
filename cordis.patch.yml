@@ -72,7 +72,7 @@
               readyPollMs: 500
               killOnStop: true
             rules:
-              - generic
+              - officeace
             concurrency: 4
             sessionHoldMs: 60000
             # 模型清单（实测自本机 officeace2api :7864 /v1/models；仓库文档里的
