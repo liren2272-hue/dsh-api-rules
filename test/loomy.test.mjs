@@ -1,13 +1,17 @@
 /**
  * loomy / loomy2api 接入的回归测试。
  *
- * 覆盖三件事：
+ * 覆盖几件事：
  *  1. loomy 路由的 normalizeRoute 正确规整 launch（command/args/cwd/env/readyUrl），
  *     且 env 里钉死的网关 key 能存活下来（这是「首次启动随机 key 只打印一次」的对策）；
  *  2. loomyRules 的请求整形：剥离 reasoning/reasoning_effort/thinking、把
- *     max_completion_tokens/max_output_tokens 归一到 max_tokens，且不做任何语义改写；
- *     null content chunk 归一成空串；finish_reason 兜底；
- *  3. 与 raccoon 同构：上游自己换号重试，本层只认 429/502/503/504、退避短、不叠重试预算。
+ *     max_completion_tokens/max_output_tokens 归一到 max_tokens；
+ *     并注入一方客户端元数据 request_purpose / msg_id / turn_id（UUID），让经本代理
+ *     转发的裸 OpenAI 请求带上官方客户端头、躲开星火上游对「API 反代」的风控采样；
+ *  3. null content chunk 归一成空串；finish_reason 兜底；
+ *  4. 与 raccoon 同构：上游自己换号重试，本层只认 429/502/503/504（外加那句已知
+ *     瞬时 400「请求有误」）、退避短、不叠重试预算；
+ *  5. vendor 内嵌网关的 400 瞬时重试补丁还在（避免 vendor 重新同步把补丁冲掉）。
  *
  * 不连真实 loomy2api。运行：node test/loomy.test.mjs
  */
@@ -107,6 +111,26 @@ function equal(name, actual, expected) {
   check('loomy 无 max 字段时不补', !('max_tokens' in body))
 }
 
+// ------------------------------------------------- 一方客户端元数据注入（反「API 反代」风控）
+// vendored 网关 server.py:1662-1670 会把 body 里的这些字段 pop 出来转成官方请求头：
+//   request_purpose -> X-Loomy-Request-Purpose，msg_id -> MsgId，turn_id -> TurnId。
+// 不注入 chat_id：它会被 session_key()（server.py:1621，早于 pop）抢先消费、把粘性键
+// 从 d-<...> 改成 c-<...>，每轮换 UUID 就会在多账号池下每轮换号，破坏会话粘性。
+{
+  const body = { model: 'spark-x2.6', messages: [{ role: 'user', content: 'hi' }] }
+  loomyRules.normalizeRequest({ body })
+  equal('loomy 注入 request_purpose = chat.message', body['request_purpose'], 'chat.message')
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  check('loomy 注入 msg_id 为 UUID', typeof body['msg_id'] === 'string' && uuidRe.test(body['msg_id']), String(body['msg_id']))
+  check('loomy 注入 turn_id 为 UUID', typeof body['turn_id'] === 'string' && uuidRe.test(body['turn_id']), String(body['turn_id']))
+  check('loomy 不注入 chat_id（避免破坏 session_key 粘性）', !('chat_id' in body))
+  // 每次调用生成新 id；proxy 只 stringify 一次，多次尝试复用同一组（幂等正确）。
+  const body2 = { model: 'spark-x2.6', messages: [] }
+  loomyRules.normalizeRequest({ body: body2 })
+  check('loomy 每次请求生成不同的 msg_id', body2['msg_id'] !== body['msg_id'])
+  check('loomy 每次请求生成不同的 turn_id', body2['turn_id'] !== body['turn_id'])
+}
+
 // ------------------------------------------------- loomyRules 响应整形
 {
   equal('loomy finishReason other -> stop', loomyRules.finishReason('other'), 'stop')
@@ -134,6 +158,16 @@ function equal(name, actual, expected) {
   check('loomy 403 不重试', loomyRules.isRetryable({ status: 403 }) === false)
   check('loomy 200 不重试', loomyRules.isRetryable({ status: 200 }) === false)
   check('loomy 500 不重试（上游已换号处理过）', loomyRules.isRetryable({ status: 500 }) === false)
+  // 星火上游对「API 反代」的间歇性风控：网关内部 1s×3 原地重试全撞同一窗口、
+  // 用尽后把这句已知瞬时 400 透传出来，本层用 2s/4s 退避摊出窗口再试。
+  // lastText 是 proxy 从 17890 网关读到的原始 400 body（网关用尽后透传），不带
+  // 「upstream 400:」前缀——那个前缀是 proxy 抛给客户端时 upstreamError 才拼的。
+  const transient400 = '{"error":{"message":"请求有误，请重试；若多次出现请更新应用版本","type":"invalid_request_error","param":null,"code":400,"metadata":{"provider_name":"iflytek-spark-loomy"}}}'
+  check('loomy 已知瞬时 400 可重试（网关原始 body）', loomyRules.isRetryable({ status: 400, text: transient400 }) === true)
+  // 只认这句文案：真正坏掉的 400 不能白烧重试（400 没带文案也不重试）。
+  check('loomy 其它 400 不重试', loomyRules.isRetryable({ status: 400, text: 'messages 不能为空' }) === false)
+  check('loomy 无文案 400 不重试', loomyRules.isRetryable({ status: 400 }) === false)
+  check('loomy 非 400 状态带该文案也不重试', loomyRules.isRetryable({ status: 422, text: transient400 }) === false)
   // 退避短一档：账号冷却以百秒计，本层只是磨掉瞬时抖动。
   check('loomy 退避上限 15s', loomyRules.backoffMs({ attempt: 10 }) <= 15_000)
   check('loomy 重试预算 20s', loomyRules.retryBudgetMs({}) === 20_000)
@@ -180,6 +214,13 @@ function equal(name, actual, expected) {
     check('_chat_stream 内有 400 透传', /if last_400 is not None:/.test(chatStreamBody))
     check('_messages_stream 内有 400 守卫', /if resp\.status == 400:/.test(msgsStreamBody))
     check('_messages_stream 内有 400 透传', /if last_400 is not None:/.test(msgsStreamBody))
+    // rules 层注入的 request_purpose / msg_id / turn_id 依赖 server.py 的现成扩展点
+    // （pop 成 X-Loomy-Request-Purpose/MsgId/TurnId 头）。vendor 重新同步若删掉它，
+    // 注入字段会变成未知 body 字段原样转发 → 反代指纹依旧。这里守住这个依赖。
+    check('vendor 扩展点仍会 pop request_purpose', /purpose\s*=\s*req\.pop\("request_purpose",\s*None\)/.test(serverSrc))
+    check('vendor 扩展点仍转 X-Loomy-Request-Purpose 头', /extra\["X-Loomy-Request-Purpose"\]\s*=\s*purpose/.test(serverSrc))
+    check('vendor 扩展点仍 pop msg_id -> MsgId', /\("msg_id",\s*"MsgId"\)/.test(serverSrc))
+    check('vendor 扩展点仍 pop turn_id -> TurnId', /\("turn_id",\s*"TurnId"\)/.test(serverSrc))
   }
   if (configSrc) {
     check('vendor 配置有 transient_400_retries 默认值', /"transient_400_retries":\s*\d+/.test(configSrc))
