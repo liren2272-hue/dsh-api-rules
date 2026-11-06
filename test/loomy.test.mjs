@@ -6,12 +6,13 @@
  *     且 env 里钉死的网关 key 能存活下来（这是「首次启动随机 key 只打印一次」的对策）；
  *  2. loomyRules 的请求整形：剥离 reasoning/reasoning_effort/thinking、把
  *     max_completion_tokens/max_output_tokens 归一到 max_tokens；
- *     并注入一方客户端元数据 request_purpose / msg_id / turn_id（UUID），让经本代理
- *     转发的裸 OpenAI 请求带上官方客户端头、躲开星火上游对「API 反代」的风控采样；
- *  3. null content chunk 归一成空串；finish_reason 兜底；
- *  4. 与 raccoon 同构：上游自己换号重试，本层只认 429/502/503/504（外加那句已知
- *     瞬时 400「请求有误」）、退避短、不叠重试预算；
- *  5. vendor 内嵌网关的 400 瞬时重试补丁还在（避免 vendor 重新同步把补丁冲掉）。
+ *  3. **决定性修复**：给 tools 里不合规的「裸属性表」parameters 补上标准
+ *     {type:object, properties} 外壳——根级 `type` 键正是 spark-x2.6 确定性 400
+ *     「请求有误…iflytek-spark-loomy」的触发点（与 officeace.mjs 同类）；
+ *  4. null content chunk 归一成空串；finish_reason 兜底；
+ *  5. 与 raccoon 同构：上游自己换号重试，本层只认 429/502/503/504，
+ *     400 一律不重试（确定性 400 重试只会污染 keep-alive 连接），退避短、不叠预算；
+ *  6. vendor 内嵌网关的 400 瞬时重试补丁还在（避免 vendor 重新同步把补丁冲掉）。
  *
  * 不连真实 loomy2api。运行：node test/loomy.test.mjs
  */
@@ -111,24 +112,100 @@ function equal(name, actual, expected) {
   check('loomy 无 max 字段时不补', !('max_tokens' in body))
 }
 
-// ------------------------------------------------- 一方客户端元数据注入（反「API 反代」风控）
-// vendored 网关 server.py:1662-1670 会把 body 里的这些字段 pop 出来转成官方请求头：
-//   request_purpose -> X-Loomy-Request-Purpose，msg_id -> MsgId，turn_id -> TurnId。
-// 不注入 chat_id：它会被 session_key()（server.py:1621，早于 pop）抢先消费、把粘性键
-// 从 d-<...> 改成 c-<...>，每轮换 UUID 就会在多账号池下每轮换号，破坏会话粘性。
+// ------------------------------------------------- 裸 tools 参数补壳（真正的修复）
+// 决定性消融（见 probe_flat_tools.py）：合规 object 外壳 tools → 200；
+// 裸属性表（根级 `type` 键）→ 400 iflytek-spark-loomy；补壳后 → 200。
+// 与 officeace.mjs 的 ModelArts 81001 同类根因、同款修复。
+function flatTool(name, withType = true) {
+  const params = {
+    listPath: { type: 'string', description: 'url list file' },
+    query: { type: 'string', description: 'keywords' },
+    top: { type: 'integer', description: 'top N' },
+  }
+  if (withType) params.type = { type: 'string', enum: ['all', 'journal', 'thesis'] }
+  else params.kind = { type: 'string', enum: ['all', 'journal', 'thesis'] }
+  return { type: 'function', function: { name, description: 'do ' + name, parameters: params } }
+}
+function cleanTool(name) {
+  return {
+    type: 'function',
+    function: {
+      name,
+      description: 'do ' + name,
+      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+    },
+  }
+}
+
 {
-  const body = { model: 'spark-x2.6', messages: [{ role: 'user', content: 'hi' }] }
+  // 裸属性表（含根级 type 键）应被补成 {type:object, properties: 原表}。
+  const body = { model: 'spark-x2.6', messages: [{ role: 'user', content: 'hi' }], tools: [flatTool('cnki_search')] }
+  const { notes } = loomyRules.normalizeRequest({ body })
+  const p = body.tools[0].function.parameters
+  equal('loomy 裸根补壳：根 type 变成 object', p.type, 'object')
+  check('loomy 裸根补壳：properties 是对象', p.properties !== null && typeof p.properties === 'object' && !Array.isArray(p.properties))
+  // 参数一个不少、名字一个不改，根级 `type` 降级为 properties 里的普通参数。
+  const props = (p.properties !== null && typeof p.properties === 'object' && !Array.isArray(p.properties)) ? p.properties : {}
+  check('loomy 补壳保留 listPath/query/top 三个参数', ['listPath', 'query', 'top'].every((k) => k in props))
+  check('loomy 补壳把根级 type 降为 properties.type 普通参数', 'type' in props && typeof props.type === 'object')
+  check('loomy 补壳写进 notes', notes.some((n) => n.includes('flat tool parameter')))
+}
+
+{
+  // 合规 object 外壳一律原样放行（不重写、不计数）。
+  const original = cleanTool('alpha')
+  const snapshot = JSON.stringify(original)
+  const body = { model: 'spark-x2.6', messages: [], tools: [original] }
+  const { notes } = loomyRules.normalizeRequest({ body })
+  equal('loomy 合规 object 外壳原样不动', JSON.stringify(body.tools[0]), snapshot)
+  check('loomy 合规外壳不写补壳 notes', !notes.some((n) => n.includes('flat tool parameter')))
+}
+
+{
+  // type:object 但 properties 缺失/不合规：只补 properties，保留同级 schema 关键字。
+  const body = { model: 'x', messages: [], tools: [{ type: 'function', function: { name: 'x', parameters: { type: 'object', required: ['a'] } } }] }
   loomyRules.normalizeRequest({ body })
-  equal('loomy 注入 request_purpose = chat.message', body['request_purpose'], 'chat.message')
-  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-  check('loomy 注入 msg_id 为 UUID', typeof body['msg_id'] === 'string' && uuidRe.test(body['msg_id']), String(body['msg_id']))
-  check('loomy 注入 turn_id 为 UUID', typeof body['turn_id'] === 'string' && uuidRe.test(body['turn_id']), String(body['turn_id']))
-  check('loomy 不注入 chat_id（避免破坏 session_key 粘性）', !('chat_id' in body))
-  // 每次调用生成新 id；proxy 只 stringify 一次，多次尝试复用同一组（幂等正确）。
-  const body2 = { model: 'spark-x2.6', messages: [] }
-  loomyRules.normalizeRequest({ body: body2 })
-  check('loomy 每次请求生成不同的 msg_id', body2['msg_id'] !== body['msg_id'])
-  check('loomy 每次请求生成不同的 turn_id', body2['turn_id'] !== body['turn_id'])
+  const p = body.tools[0].function.parameters
+  equal('loomy 缺 properties 的 object 只补 properties', p.type, 'object')
+  check('loomy 补 properties 为对象', p.properties !== null && typeof p.properties === 'object')
+  check('loomy 保留 required 同级关键字', Array.isArray(p.required) && p.required[0] === 'a')
+}
+
+{
+  // 裸 {name, parameters} 形状（无 function 包装）也要处理。
+  const body = { model: 'x', messages: [], tools: [{ name: 'bare', parameters: { type: { type: 'string' }, q: { type: 'string' } } }] }
+  loomyRules.normalizeRequest({ body })
+  const p = body.tools[0].parameters
+  equal('loomy 裸工具形状也补壳', p.type, 'object')
+  const props = (p.properties !== null && typeof p.properties === 'object' && !Array.isArray(p.properties)) ? p.properties : {}
+  check('loomy 裸工具形状保留原参数', 'type' in props && 'q' in props)
+}
+
+{
+  // 贴近真实：93 个合规 + 6 个裸根（cnki_* 家族），全部裸根都要补。
+  const tools = []
+  for (let i = 0; i < 93; i++) tools.push(cleanTool('tool_' + i))
+  const flatNames = ['cnki_search', 'cnki_download', 'cnki_batch', 'cnki_verify', 'cnki_task_status', 'cnki_doctor']
+  for (const n of flatNames) tools.push(flatTool(n))
+  const body = { model: 'spark-x2.6', messages: [], tools }
+  const { notes } = loomyRules.normalizeRequest({ body })
+  const wrapped = body.tools.filter((t) => {
+    const fn = t.function || t
+    return fn.parameters && fn.parameters.type === 'object'
+  }).length
+  equal('loomy 99 工具混合：全部补成合规外壳', wrapped, 99)
+  check('loomy 99 工具混合：notes 报 6 个补壳', notes.some((n) => n.includes('wrapped 6 flat tool parameter')))
+}
+
+{
+  // 非数组 tools / 缺 parameters / 非对象 tools 不崩、不误补。
+  for (const tools of [undefined, null, 'oops', {}, [null, 3, 'x'], [{ type: 'function', function: { name: 'nope' } }]]) {
+    const body = { model: 'x', messages: [] }
+    if (tools !== undefined) body.tools = tools
+    let ok = true
+    try { loomyRules.normalizeRequest({ body }) } catch (e) { ok = false; console.log('  threw: ' + e.message) }
+    check('loomy 异常 tools 形状不崩（' + JSON.stringify(tools) + '）', ok)
+  }
 }
 
 // ------------------------------------------------- loomyRules 响应整形
@@ -158,13 +235,11 @@ function equal(name, actual, expected) {
   check('loomy 403 不重试', loomyRules.isRetryable({ status: 403 }) === false)
   check('loomy 200 不重试', loomyRules.isRetryable({ status: 200 }) === false)
   check('loomy 500 不重试（上游已换号处理过）', loomyRules.isRetryable({ status: 500 }) === false)
-  // 星火上游对「API 反代」的间歇性风控：网关内部 1s×3 原地重试全撞同一窗口、
-  // 用尽后把这句已知瞬时 400 透传出来，本层用 2s/4s 退避摊出窗口再试。
-  // lastText 是 proxy 从 17890 网关读到的原始 400 body（网关用尽后透传），不带
-  // 「upstream 400:」前缀——那个前缀是 proxy 抛给客户端时 upstreamError 才拼的。
+  // 400 一律不重试：tools 补壳后那句 iflytek-spark-loomy 400 已不会再出现；
+  // 万一有别种 400（空 messages、参数非法）那是确定性失败，重试不会改变结果，
+  // 实测还曾把网关 keep-alive 连接拖出二次「messages 不能为空」，反把真错误盖掉。
   const transient400 = '{"error":{"message":"请求有误，请重试；若多次出现请更新应用版本","type":"invalid_request_error","param":null,"code":400,"metadata":{"provider_name":"iflytek-spark-loomy"}}}'
-  check('loomy 已知瞬时 400 可重试（网关原始 body）', loomyRules.isRetryable({ status: 400, text: transient400 }) === true)
-  // 只认这句文案：真正坏掉的 400 不能白烧重试（400 没带文案也不重试）。
+  check('loomy 已知瞬时 400 也不重试（交给上游确定性错误）', loomyRules.isRetryable({ status: 400, text: transient400 }) === false)
   check('loomy 其它 400 不重试', loomyRules.isRetryable({ status: 400, text: 'messages 不能为空' }) === false)
   check('loomy 无文案 400 不重试', loomyRules.isRetryable({ status: 400 }) === false)
   check('loomy 非 400 状态带该文案也不重试', loomyRules.isRetryable({ status: 422, text: transient400 }) === false)
@@ -175,9 +250,10 @@ function equal(name, actual, expected) {
 }
 
 // ------------------------------------------------- vendor 内嵌 loomy2api：上游 400 瞬时重试
-// 星火 spark-x2.6 等模型会间歇性回 400「请求有误，请重试；若多次出现请更新应用版本」。
+// 星火 spark-x2.6 等模型会回 400「请求有误，请重试；若多次出现请更新应用版本」。
 // 内嵌网关 vendor/loomy2api 原先把 400 当 FATAL 直接判死，单账号池下瞬间变 502。
 // 这里只读校验 vendor 补丁还在（避免将来 vendor 重新同步把补丁冲掉却没人发现）。
+// 注：真正的根因已在 rules 层用「裸 tools 补壳」修掉，这层只是防御性兜底。
 {
   const here = dirname(fileURLToPath(import.meta.url))
   const vendorRoot = join(here, '..', 'vendor', 'loomy2api', 'loomy2api')
@@ -214,13 +290,6 @@ function equal(name, actual, expected) {
     check('_chat_stream 内有 400 透传', /if last_400 is not None:/.test(chatStreamBody))
     check('_messages_stream 内有 400 守卫', /if resp\.status == 400:/.test(msgsStreamBody))
     check('_messages_stream 内有 400 透传', /if last_400 is not None:/.test(msgsStreamBody))
-    // rules 层注入的 request_purpose / msg_id / turn_id 依赖 server.py 的现成扩展点
-    // （pop 成 X-Loomy-Request-Purpose/MsgId/TurnId 头）。vendor 重新同步若删掉它，
-    // 注入字段会变成未知 body 字段原样转发 → 反代指纹依旧。这里守住这个依赖。
-    check('vendor 扩展点仍会 pop request_purpose', /purpose\s*=\s*req\.pop\("request_purpose",\s*None\)/.test(serverSrc))
-    check('vendor 扩展点仍转 X-Loomy-Request-Purpose 头', /extra\["X-Loomy-Request-Purpose"\]\s*=\s*purpose/.test(serverSrc))
-    check('vendor 扩展点仍 pop msg_id -> MsgId', /\("msg_id",\s*"MsgId"\)/.test(serverSrc))
-    check('vendor 扩展点仍 pop turn_id -> TurnId', /\("turn_id",\s*"TurnId"\)/.test(serverSrc))
   }
   if (configSrc) {
     check('vendor 配置有 transient_400_retries 默认值', /"transient_400_retries":\s*\d+/.test(configSrc))
