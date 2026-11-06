@@ -49,6 +49,11 @@ DEFAULTS: Dict[str, Any] = {
     "accounts_file": "accounts.json",
     "strategy": "weighted",       # weighted(三因子加权随机) | balance | round_robin | lru
     "max_retries": 2,             # extra accounts tried on auth/quota errors
+    # 上游偶发 400（如 spark-x2.6「请求有误，请重试；若多次出现请更新应用版本」）
+    # 是瞬时拒绝、不是请求本身坏——原地同账号稍等重试，而不是像 404/422 那样
+    # 直接判死。400 重试用尽后才把错误透传给客户端。
+    "transient_400_retries": 2,          # 同一请求遇上游 400 时原地重试的额外次数
+    "transient_400_backoff_seconds": 1.0,  # 每次重试前的等待（秒）
     # 非流式请求 max_tokens ≥ 此值 → 启用 chunked 保活（每 15s 写一个
     # JSON 合法前导空白），绕开 Cloudflare 免费版 60~100s 的 504。
     "keepalive_min_tokens": 1500,

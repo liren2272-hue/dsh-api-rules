@@ -451,7 +451,18 @@ class Handler(BaseHTTPRequestHandler):
     #: Statuses that implicate the *account* (drop its session / cool it down).
     ACCOUNT_FAULT = (401, 403, 402, 429)
     #: Statuses where retrying is pointless (the request itself is wrong).
-    FATAL_REQUEST = (400, 404, 422)
+    #: 400 从这里移出：星火 spark-x2.6 等模型会间歇性回 400「请求有误，请重试；
+    #: 若多次出现请更新应用版本」——那是瞬时拒绝，不是请求本身坏。真坏的请求
+    #: （空 messages、未知模型）重试也只会再 400，用尽 transient_400_retries
+    #: 后照样把错误透传，所以放宽到可重试是安全的。
+    FATAL_REQUEST = (404, 422)
+
+    def _transient_400_sleep(self) -> float:
+        """上游 400 原地重试前的等待秒数（0 = 未开启）。"""
+        try:
+            return max(0.0, float(self.gateway.cfg.get("transient_400_backoff_seconds") or 0))
+        except Exception:                              # noqa: BLE001
+            return 0.0
 
     def setup(self):                               # noqa: D102
         super().setup()
@@ -1521,6 +1532,7 @@ class Handler(BaseHTTPRequestHandler):
         last: Tuple[int, bytes] = (0, b"")
         pool_err = ""
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+            t400 = 0  # 上游 400 瞬时重试计数
             try:
                 acc = gw.pool.acquire(model=model)
             except PoolError as exc:
@@ -1566,8 +1578,18 @@ class Handler(BaseHTTPRequestHandler):
                             error=reason, proxy=acc.proxy)
             gw.pool.report_failure(acc, status, reason, model=model)
             last = (status, data)
-            if status in self.FATAL_REQUEST:        # not an account problem
+            if status in self.FATAL_REQUEST:        # 404/422 请求本身坏，判死
                 break
+            if status == 400:
+                t400 += 1
+                if t400 > int(gw.cfg.get("transient_400_retries") or 0):
+                    break                           # 400 重试用尽 → 透传错误
+                time.sleep(self._transient_400_sleep())
+                gw.log(f"[call] {acc.name} {model} http=400 → 上游瞬时拒绝，"
+                       f"原地重试 {t400}/{int(gw.cfg.get('transient_400_retries') or 0)}")
+                if tried and tried[-1] == acc.name:
+                    tried.pop()                     # 允许再次选中该账号（单账号池）或轮换
+                continue
         if not last[1]:
             return (503, json.dumps(
                 {"error": {"message": pool_err or "无可用账号 / no usable account",
@@ -1658,6 +1680,7 @@ class Handler(BaseHTTPRequestHandler):
             last: Tuple[int, bytes] = (0, b"")
             pool_err = ""
             for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+                t400 = 0  # 上游 400 瞬时重试计数
                 try:
                     acc = gw.pool.acquire(exclude=tried, model=model,
                                           session_key_value=skey)
@@ -1716,8 +1739,18 @@ class Handler(BaseHTTPRequestHandler):
                     gw.pool.report_failure(acc, status, reason, model=model)
                     gw.log(f"[call] {acc.name} {model} http={status} → 上游异常，换账号重试"
                            f"（不冷却该账号）")
-                if status in self.FATAL_REQUEST:        # not an account problem
+                if status in self.FATAL_REQUEST:        # 404/422 请求本身坏，判死
                     break
+                if status == 400:
+                    t400 += 1
+                    if t400 > int(gw.cfg.get("transient_400_retries") or 0):
+                        break                           # 400 重试用尽 → 透传错误
+                    time.sleep(self._transient_400_sleep())
+                    gw.log(f"[call] {acc.name} {model} http=400 → 上游瞬时拒绝，"
+                           f"原地重试 {t400}/{int(gw.cfg.get('transient_400_retries') or 0)}")
+                    if tried and tried[-1] == acc.name:
+                        tried.pop()                     # 允许再次选中该账号（单账号池）或轮换
+                    continue
             if not last[1]:
                 # 一次上游都没打成（池子空 / 全在冷却 / 模型级冷却）——
                 # 给客户端一个明确的 503，而不是 502 + 空 body。
@@ -1971,6 +2004,7 @@ class Handler(BaseHTTPRequestHandler):
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+            t400 = 0  # 上游 400 瞬时重试计数
             try:
                 acc = gw.pool.acquire(exclude=tried, model=model,
                                       session_key_value=skey)
@@ -2008,8 +2042,18 @@ class Handler(BaseHTTPRequestHandler):
                 gw.pool.report_failure(acc, status, reason, model=model)
                 gw.log(f"[messages] {acc.name} {model} http={status}"
                        f" → 上游异常，换账号重试（不冷却该账号）")
-            if status in self.FATAL_REQUEST:
+            if status in self.FATAL_REQUEST:        # 404/422 请求本身坏，判死
                 break
+            if status == 400:
+                t400 += 1
+                if t400 > int(gw.cfg.get("transient_400_retries") or 0):
+                    break                           # 400 重试用尽 → 透传错误
+                time.sleep(self._transient_400_sleep())
+                gw.log(f"[call] {acc.name} {model} http=400 → 上游瞬时拒绝，"
+                       f"原地重试 {t400}/{int(gw.cfg.get('transient_400_retries') or 0)}")
+                if tried and tried[-1] == acc.name:
+                    tried.pop()                     # 允许再次选中该账号（单账号池）或轮换
+                continue
         status, data = last
         return self._json(status or 502, {
             "type": "error",

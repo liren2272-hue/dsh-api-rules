@@ -12,6 +12,9 @@
  * 不连真实 loomy2api。运行：node test/loomy.test.mjs
  */
 
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { normalizeRoute } from '../lib/proxy.mjs'
 import { loomyRules } from '../lib/rules/loomy.mjs'
 
@@ -135,6 +138,44 @@ function equal(name, actual, expected) {
   check('loomy 退避上限 15s', loomyRules.backoffMs({ attempt: 10 }) <= 15_000)
   check('loomy 重试预算 20s', loomyRules.retryBudgetMs({}) === 20_000)
   check('loomy 全局冷却 0（不叠冷却）', loomyRules.cooldownMs() === 0)
+}
+
+// ------------------------------------------------- vendor 内嵌 loomy2api：上游 400 瞬时重试
+// 星火 spark-x2.6 等模型会间歇性回 400「请求有误，请重试；若多次出现请更新应用版本」。
+// 内嵌网关 vendor/loomy2api 原先把 400 当 FATAL 直接判死，单账号池下瞬间变 502。
+// 这里只读校验 vendor 补丁还在（避免将来 vendor 重新同步把补丁冲掉却没人发现）。
+{
+  const here = dirname(fileURLToPath(import.meta.url))
+  const vendorRoot = join(here, '..', 'vendor', 'loomy2api', 'loomy2api')
+  let serverSrc = ''
+  let configSrc = ''
+  try {
+    serverSrc = readFileSync(join(vendorRoot, 'server.py'), 'utf8')
+    configSrc = readFileSync(join(vendorRoot, 'config.py'), 'utf8')
+  } catch (error) {
+    check('vendor loomy2api 源码可读', false, String(error?.message ?? error))
+  }
+  if (serverSrc) {
+    // 400 必须从 FATAL_REQUEST 移出（只留 404/422），否则仍会判死。
+    const fatal = serverSrc.match(/FATAL_REQUEST\s*=\s*\(([^)]*)\)/)
+    check('vendor FATAL_REQUEST 已移出 400', fatal !== null && !/\b400\b/.test(fatal[1]), fatal && fatal[1])
+    check('vendor FATAL_REQUEST 仍含 404', fatal !== null && /\b404\b/.test(fatal[1]))
+    check('vendor FATAL_REQUEST 仍含 422', fatal !== null && /\b422\b/.test(fatal[1]))
+    // 400 专属守卫：计数、封顶、退避、允许重选同账号、continue。
+    check('vendor 有 400 瞬时重试守卫', /if status == 400:/.test(serverSrc))
+    check('vendor 有 400 重试计数器', /t400 \+= 1/.test(serverSrc))
+    check('vendor 400 预算用尽即透传', /t400 > int\(gw\.cfg\.get\("transient_400_retries"\) or 0\)/.test(serverSrc))
+    check('vendor 400 重试前退避', /time\.sleep\(self\._transient_400_sleep\(\)\)/.test(serverSrc))
+    check('vendor 400 重试弹出来过账号再 continue', /tried\.pop\(\)/.test(serverSrc))
+    check('vendor 有退避秒数 helper', /def _transient_400_sleep/.test(serverSrc))
+    // 三条 chat/messages 重试路径都要补上（chat 非流式 / chat 流式 / messages）。
+    const guardCount = (serverSrc.match(/if status == 400:/g) || []).length
+    check('vendor 三条重试路径都补了 400 守卫', guardCount === 3, 'got ' + guardCount)
+  }
+  if (configSrc) {
+    check('vendor 配置有 transient_400_retries 默认值', /"transient_400_retries":\s*\d+/.test(configSrc))
+    check('vendor 配置有 transient_400_backoff_seconds 默认值', /"transient_400_backoff_seconds":\s*[\d.]+/.test(configSrc))
+  }
 }
 
 console.log('\n' + passes + ' passed, ' + failures + ' failed')
