@@ -1801,6 +1801,8 @@ class Handler(BaseHTTPRequestHandler):
         first_chunk = b""
         probe_started = time.time()
         first_chunk_at = None
+        t400 = 0            # 上游 400 瞬时重试计数（循环外累加，封顶才生效）
+        last_400: Optional[Tuple[int, bytes]] = None   # 最后一个 400 原始响应，用尽后透传
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
                 acc = gw.pool.acquire(exclude=tried, model=model,
@@ -1853,6 +1855,24 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
             reason = data[:200].decode("utf-8", "replace")
             gw.pool.release(acc)
+            if resp.status == 400:
+                # spark-x2.6 等模型会间歇性回 400「请求有误，请重试」——上游瞬时
+                # 拒绝，不是请求本身坏：不罚账号，原地同账号退避重试；用尽预算
+                # 后把上游原始 400 透传，别再伪装成 502（DSH 全走流式路径）。
+                last_400 = (resp.status, data)
+                t400 += 1
+                budget = int(gw.cfg.get("transient_400_retries") or 0)
+                if t400 <= budget:
+                    time.sleep(self._transient_400_sleep())
+                    gw.log(f"[call] {acc.name} {model} stream http=400 → 上游瞬时拒绝，"
+                           f"原地重试 {t400}/{budget}")
+                    if tried and tried[-1] == acc.name:
+                        tried.pop()                 # 允许再次选中该账号（单账号池）
+                    conn = resp = None
+                    continue
+                conn = resp = None
+                break                               # 400 重试用尽 → 透传原始错误
+            last_400 = None
             if resp.status in self.ACCOUNT_FAULT:
                 gw.log(f"[call] {acc.name} {model} stream http={resp.status}"
                        f" → 账号问题，换账号重试")
@@ -1866,6 +1886,13 @@ class Handler(BaseHTTPRequestHandler):
             conn = resp = None
 
         if resp is None:
+            if last_400 is not None:
+                status, data = last_400
+                try:
+                    return self._json(status, json.loads(data.decode("utf-8")))
+                except Exception:                           # noqa: BLE001
+                    return self._error(status, data[:500].decode("utf-8", "replace"),
+                                       "upstream_error")
             return self._error(502, "所有账号都失败了 / all accounts failed",
                                "upstream_error")
         if resp.status != 200:
@@ -2067,6 +2094,8 @@ class Handler(BaseHTTPRequestHandler):
         conn = resp = None
         acc = None
         started = time.time()
+        t400 = 0            # 上游 400 瞬时重试计数（循环外累加，封顶才生效）
+        last_400: Optional[Tuple[int, bytes]] = None   # 最后一个 400 原始响应，用尽后透传
 
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
@@ -2094,6 +2123,23 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
             reason = data[:200].decode("utf-8", "replace")
             gw.pool.release(acc)
+            if resp.status == 400:
+                # 同 _chat_stream：spark-x2.6 瞬时 400 原地同账号重试；用尽后
+                # 透传上游原始 400，不伪装成 502。
+                last_400 = (resp.status, data)
+                t400 += 1
+                budget = int(gw.cfg.get("transient_400_retries") or 0)
+                if t400 <= budget:
+                    time.sleep(self._transient_400_sleep())
+                    gw.log(f"[messages] {acc.name} {model} stream http=400 → 上游瞬时拒绝，"
+                           f"原地重试 {t400}/{budget}")
+                    if tried and tried[-1] == acc.name:
+                        tried.pop()
+                    conn = resp = None
+                    continue
+                conn = resp = None
+                break
+            last_400 = None
             if resp.status in self.ACCOUNT_FAULT:
                 gw.pool.report_failure(acc, resp.status, reason, model=model)
                 if skey:
@@ -2107,6 +2153,11 @@ class Handler(BaseHTTPRequestHandler):
             conn = resp = None
 
         if resp is None:
+            if last_400 is not None:
+                status, data = last_400
+                return self._json(status, {"type": "error", "error": {
+                    "type": "api_error",
+                    "message": data[:500].decode("utf-8", "replace")}})
             return self._json(502, {"type": "error", "error": {
                 "type": "api_error", "message": "all accounts failed"}})
         if resp.status != 200:

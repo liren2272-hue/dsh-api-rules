@@ -162,15 +162,24 @@ function equal(name, actual, expected) {
     check('vendor FATAL_REQUEST 仍含 404', fatal !== null && /\b404\b/.test(fatal[1]))
     check('vendor FATAL_REQUEST 仍含 422', fatal !== null && /\b422\b/.test(fatal[1]))
     // 400 专属守卫：计数、封顶、退避、允许重选同账号、continue。
-    check('vendor 有 400 瞬时重试守卫', /if status == 400:/.test(serverSrc))
+    check('vendor 有 400 瞬时重试守卫', /if (?:resp\.)?status == 400:/.test(serverSrc))
     check('vendor 有 400 重试计数器', /t400 \+= 1/.test(serverSrc))
     check('vendor 400 预算用尽即透传', /t400 > int\(gw\.cfg\.get\("transient_400_retries"\) or 0\)/.test(serverSrc))
+    check('vendor 流式 400 用预算封顶', /t400 <= budget/.test(serverSrc))
     check('vendor 400 重试前退避', /time\.sleep\(self\._transient_400_sleep\(\)\)/.test(serverSrc))
     check('vendor 400 重试弹出来过账号再 continue', /tried\.pop\(\)/.test(serverSrc))
     check('vendor 有退避秒数 helper', /def _transient_400_sleep/.test(serverSrc))
-    // 三条 chat/messages 重试路径都要补上（chat 非流式 / chat 流式 / messages）。
-    const guardCount = (serverSrc.match(/if status == 400:/g) || []).length
-    check('vendor 三条重试路径都补了 400 守卫', guardCount === 3, 'got ' + guardCount)
+    // 五条重试路径都要补上：chat/messages × 流式/非流式 + responses 兼容层。
+    // 上次修复只补了 3 条非流式，漏了 DSH 实际全走的 2 条流式（单账号池下 400 变 502）。
+    const guardCount = (serverSrc.match(/if (?:resp\.)?status == 400:/g) || []).length
+    check('vendor 五条重试路径都补了 400 守卫', guardCount === 5, 'got ' + guardCount)
+    check('vendor 用尽后透传原始 400（last_400）', /if last_400 is not None:/.test(serverSrc))
+    const chatStreamBody = serverSrc.slice(serverSrc.indexOf('def _chat_stream('), serverSrc.indexOf('def _messages('))
+    const msgsStreamBody = serverSrc.slice(serverSrc.indexOf('def _messages_stream'))
+    check('_chat_stream 内有 400 守卫', /if resp\.status == 400:/.test(chatStreamBody))
+    check('_chat_stream 内有 400 透传', /if last_400 is not None:/.test(chatStreamBody))
+    check('_messages_stream 内有 400 守卫', /if resp\.status == 400:/.test(msgsStreamBody))
+    check('_messages_stream 内有 400 透传', /if last_400 is not None:/.test(msgsStreamBody))
   }
   if (configSrc) {
     check('vendor 配置有 transient_400_retries 默认值', /"transient_400_retries":\s*\d+/.test(configSrc))
