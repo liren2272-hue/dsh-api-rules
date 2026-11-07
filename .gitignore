@@ -14,3 +14,11 @@ vendor/loomy2api/logs-test/
 vendor/loomy2api/config.json
 vendor/loomy2api/accounts.json
 vendor/loomy2api/accounts-test.json
+# 内嵌 qoder2api-hub：同 loomy2api，源码平铺纳入版本库（未纳入其上游 .git）。
+# 运行时产物（字节码缓存 / 账号 / 用量 / 日志）一律忽略；仅保留 accounts/README.txt 占位目录。
+vendor/qoder2api-hub/__pycache__/
+vendor/qoder2api-hub/accounts/*
+!vendor/qoder2api-hub/accounts/README.txt
+vendor/qoder2api-hub/usage/
+vendor/qoder2api-hub/logs/
+vendor/qoder2api-hub/qoder-proxy.log

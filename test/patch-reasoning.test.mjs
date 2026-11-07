@@ -62,6 +62,19 @@ const EXPECTED = new Map([
   ['loomy2api/GLM-5.3-Flash', ['low', 'medium', 'high', 'xhigh']],
   ['loomy2api/qwen3.8-flash', ['low', 'medium', 'high', 'xhigh']],
   ['loomy2api/mimo-v2.5', ['low', 'medium', 'high', 'xhigh']],
+  // qoder2api-hub：逐模型档位来自 qoder catalog 的 thinking_config（supported_efforts），
+  // 网关自动把上游不支持的档位归一到最近合法档（qoder_proxy.py normalize_reasoning_effort:3751）。
+  // auto / Qwen3.7-* / MiniMax-M2.7 无思考配置，不声明 reasoningEfforts（选择器不出现档位菜单）。
+  ['qoder2api-hub/Qwen3.8-Max', ['low', 'medium', 'xhigh']],
+  ['qoder2api-hub/Qwen3.8-Flash', ['low', 'medium', 'xhigh']],
+  ['qoder2api-hub/DeepSeek-V4-Pro', ['high']],
+  ['qoder2api-hub/DeepSeek-Flash', ['low', 'high']],
+  ['qoder2api-hub/GLM-5.3', ['low', 'high']],
+  ['qoder2api-hub/GLM-5.3-Flash', ['high']],
+  ['qoder2api-hub/GLM-5.2', ['high']],
+  ['qoder2api-hub/Kimi-K3', ['low', 'high']],
+  ['qoder2api-hub/Kimi-K2.8-Preview', ['low', 'high']],
+  ['qoder2api-hub/QoDuck', ['low', 'high', 'xhigh']],
   ['cline/cline-free/nemotron-3.5-super-vl', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['cline/cline-free/solar-mini4', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['cline/nvidia/nemotron-3.5-lightning-free', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
@@ -82,6 +95,9 @@ const FORBIDDEN = [
   'officeace/kimi-k3', 'officeace/qwen3-30b-a3b', 'officeace/qwen3-32b',
   'codearts/glm-5.2-sft-harmony', 'codearts/openpangu-2.0-pro', 'codearts/openpangu-2.0-flash', 'codearts/kimi-k3',
   'loomy2api/qwen-3.8-max', 'loomy2api/auto',
+  // qoder2api-hub：无思考配置的模型一律不声明（声明了选择器会出档位菜单、上游却认不了）。
+  'qoder2api-hub/Auto', 'qoder2api-hub/Qwen3.7-Max', 'qoder2api-hub/Qwen3.7-Plus',
+  'qoder2api-hub/Qwen3.7-Flash', 'qoder2api-hub/MiniMax-M2.7',
 ]
 
 let failures = 0

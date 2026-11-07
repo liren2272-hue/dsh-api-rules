@@ -334,6 +334,145 @@
               - id: auto
                 maxTokens: 65536
 
+          # Qoder（qoder2api-hub）：DSH -> 8788（本插件，回环转发 + 参数规则）-> qoder2api-hub :8790。
+          #
+          # qoder2api-hub 是 Qoder（qoder.com.cn / qoder.com）官方客户端的 OpenAI/Anthropic
+          # 兼容网关（多账号池 + Web 面板），源码内嵌在本插件的 vendor/qoder2api-hub/
+          # （纯标准库 Python，无第三方依赖），由本路由的 launch 在插件启动时自动拉起
+          # （已运行时绝不重复拉起）。它自己负责换号 / 账号轮换 / 上游 429、401、402、403、5xx
+          # 的重试与思考档位归一，本层（rules: [qoder2api-hub]）只做参数整形，不叠第二层退避。
+          #
+          # 账号来源：qoder2api-hub 启动**不会**自动导入本机凭证（只打日志），需要到面板
+          # http://127.0.0.1:8790/ 用「扫描本地凭证」/ OAuth / PAT 导入；面板默认密码 admin
+          # （本路由用 --panel-password 钉成 sk-qoder-local，与 route.apiKey 同值好记）。
+          #
+          # 与 loomy 同理：拉起的是**本插件目录里的源码副本**（vendor/qoder2api-hub），
+          # 插件之外没有任何需要保留的文件夹，误删外部目录也不会让 Qoder 失联。
+          # 解释器直接用系统 Python 3.9+（qoder2api-hub 零第三方依赖，不需要 venv）。
+          - id: qoder2api-hub
+            upstream: "http://127.0.0.1:8790/v1"
+            apiKey: "sk-qoder-local"
+            # 面板本身走密码登录，这是「打开管理面板」的跳转入口，不是登录凭证。
+            adminUrl: "http://127.0.0.1:8790/"
+            rules:
+              - qoder2api-hub
+            concurrency: 4
+            sessionHoldMs: 60000
+            launch:
+              # 用系统 Python 跑内嵌源码副本里的 qoder_proxy.py（纯标准库，无需 venv）。
+              command: "C:\\Program Files\\Python311\\python.exe"
+              args:
+                - "qoder_proxy.py"
+                - "--host"
+                - "127.0.0.1"
+                - "--port"
+                - "8790"
+                - "--api-key"
+                - "sk-qoder-local"
+                - "--panel-password"
+                - "sk-qoder-local"
+              # accounts/ / usage/ / 日志按 process.cwd()（=vendor 副本根）解析，必须指到内嵌副本根。
+              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-hub"
+              # /health 在站点根，不在 upstream 之后，所以用 readyUrl。
+              readyUrl: "http://127.0.0.1:8790/health"
+              readyTimeoutMs: 60000
+              readyPollMs: 1000
+              killOnStop: true
+            # 模型清单（取自 vendor/qoder2api-hub/qoder_catalog_cn.json 国服目录：id=display_name、
+            # contextWindow=max_input_tokens、maxTokens 同 max_input_tokens——网关自己管真实输出上限���。
+            # is_vl=true 才标 input:[text,image]（国服只有 MiniMax-M2.7 不可看图）。
+            # 上游那 3 个 type=image 的生图模型不涉及；国服/国际两套目录的模型名不完全相同，
+            # 这里按国服目录声明（本机 Qoder 客户端是国服 com.qodercn.app.stable）。
+            # 模型选择器里显示哪些由下面 llm-pi-ai 那段决定，增删模型时两处必须一起改。
+            models:
+              - id: Auto
+                contextWindow: 200000
+                maxTokens: 200000
+                input:
+                  - text
+                  - image
+              - id: Qwen3.8-Max
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Qwen3.8-Flash
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Qwen3.7-Max
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Qwen3.7-Plus
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Qwen3.7-Flash
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: DeepSeek-V4-Pro
+                contextWindow: 96000
+                maxTokens: 96000
+                input:
+                  - text
+                  - image
+              - id: DeepSeek-Flash
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: GLM-5.3
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: GLM-5.3-Flash
+                contextWindow: 1000000
+                maxTokens: 1000000
+                input:
+                  - text
+                  - image
+              - id: GLM-5.2
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Kimi-K3
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Kimi-K2.8-Preview
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: MiniMax-M2.7
+                contextWindow: 180000
+                maxTokens: 180000
+              - id: QoDuck
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+
 # ---------------------------------------------------------------------------
 # DSH 侧的 provider 注册 —— 与上面同一个插件，跟随插件一起安装。
 #
@@ -771,4 +910,152 @@
           - id: auto
             name: Auto（上游自动选模型）
             maxTokens: 65536
+
+      # Qoder（qoder2api-hub）：baseURL 指向本插件 8788 上的 /qoder2api-hub/v1 路由，
+      # 该路由在插件启动时自动拉起内嵌的 vendor/qoder2api-hub（默认 :8790）。
+      #
+      # 这里是**模型选择器显示哪些模型**的唯一来源：llm-pi-ai 不会向上游查询清单，
+      # 只展示这段里声明过的条目。与上面 qoder2api-hub 路由的 models 保持一致（增删两处一起改）。
+      # input: [text, image] 标记视觉模型，DSH 才会在 UI 上给出「发图」入口并真正送图。
+      # reasoningEfforts 取自 qoder_catalog_cn.json 逐模型的 thinking_config.enabled.efforts
+      # （Auto / Qwen3.7-* / MiniMax-M2.7 上游未给思考档位，不声明；网关会按模型归一档位）。
+      qoder2api-hub:
+        # 模型选择器里这个 provider 的**显示名**；map key 本身是功能路由键，不能改。
+        displayName: Qoder
+        apiKeyEnv: API_RULES_BEARER
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/qoder2api-hub/v1
+        models:
+          - id: Auto
+            name: Auto（上游自动选模型）
+            contextWindow: 200000
+            maxTokens: 200000
+            input:
+              - text
+              - image
+          - id: Qwen3.8-Max
+            name: Qwen3.8-Max
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              xhigh: xhigh
+          - id: Qwen3.8-Flash
+            name: Qwen3.8-Flash
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              xhigh: xhigh
+          - id: Qwen3.7-Max
+            name: Qwen3.7-Max
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+          - id: Qwen3.7-Plus
+            name: Qwen3.7-Plus
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+          - id: Qwen3.7-Flash
+            name: Qwen3.7-Flash
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+          - id: DeepSeek-V4-Pro
+            name: DeepSeek-V4-Pro
+            contextWindow: 96000
+            maxTokens: 96000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              high: high
+          - id: DeepSeek-Flash
+            name: DeepSeek-Flash
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+          - id: GLM-5.3
+            name: GLM-5.3
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+          - id: GLM-5.3-Flash
+            name: GLM-5.3-Flash
+            contextWindow: 1000000
+            maxTokens: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              high: high
+          - id: GLM-5.2
+            name: GLM-5.2
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              high: high
+          - id: Kimi-K3
+            name: Kimi-K3
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+          - id: Kimi-K2.8-Preview
+            name: Kimi-K2.8-Preview
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+          - id: MiniMax-M2.7
+            name: MiniMax-M2.7
+            contextWindow: 180000
+            maxTokens: 180000
+          - id: QoDuck
+            name: QoDuck
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              xhigh: xhigh
 
