@@ -1949,8 +1949,12 @@ class Handler(BaseHTTPRequestHandler):
             gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s http=200 "
                    f"{human_usage(usage)}{_rate(usage, elapsed)} "
                    f"ttfb={ttfb:.2f}s stream")
-        except (BrokenPipeError, ConnectionResetError):
-            gw.log(f"[call] {acc.name} {model} client disconnected")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as exc:
+            # ConnectionAbortedError[WinError 10053] 是 DSH 侧把连接掐了（典型：规则层
+            # 120s 上游超时关掉响应体），不是上游断流。按 server.py:489 的既有约定归到
+            # 「客户端已断开」，别再打「stream 中断 → 发收尾帧」刷监控面板。
+            gw.log(f"[call] {acc.name} {model} client disconnected "
+                   f"（{type(exc).__name__}）")
         except Exception as exc:                        # noqa: BLE001
             # 上游断流 / 读超时：记账 + 给客户端发**收尾帧**。之前这里直接
             # 关连接，SSE 没有 [DONE]，客户端 aiohttp 报「对端在未发送完整

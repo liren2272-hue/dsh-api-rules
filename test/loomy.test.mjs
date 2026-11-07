@@ -298,5 +298,113 @@ function cleanTool(name) {
   }
 }
 
+// ------------------------------------------------- spark-x2.6 断流把思考当结果 + 10053 收尾帧（回归）
+// 根因：postWithRetry 的 AbortSignal.timeout(120s) 掐断长思考流的响应体 → 网关
+// self.wfile.write 抛 ConnectionAbortedError[WinError 10053] → _chat_stream 误判
+// 「上游断流」发「无 choices 的 error 帧 + [DONE]」→ pipeStream 不认识它、补
+// finish_reason:'stop'，于是只剩 reasoning_content 的截断流被当成正常答案输出。
+// 修复（全部语义落在规则层，便于其它上游扩展）：
+//   F1 路由 timeoutMs=3600000；F2 规则层翻译断流 error 帧（translateBusinessError
+//   / statusForError）；F3 规则层拒绝伪造 stop（ensureFinishReason(model, meta)）+
+//   规则层自定义收尾帧（streamAbortFrame(meta)，registry 声明缺省、proxy 只问钩子）；
+//   F4 网关把 ConnectionAbortedError 归为「客户端已断开」。
+{
+  const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const readSrc = (rel) => { try { return readFileSync(join(pluginRoot, rel), 'utf8') } catch { return '' } }
+  const proxySrc = readSrc('lib/proxy.mjs')
+  const registrySrc = readSrc('lib/registry.mjs')
+  const loomySrc = readSrc('lib/rules/loomy.mjs')
+  const patchSrc = readSrc('cordis.patch.yml')
+  const serverSrc2 = readSrc('vendor/loomy2api/loomy2api/server.py')
+  const tbe = typeof loomyRules.translateBusinessError === 'function' ? loomyRules.translateBusinessError : () => undefined
+  const sfe = typeof loomyRules.statusForError === 'function' ? loomyRules.statusForError : () => undefined
+  const saf = typeof loomyRules.streamAbortFrame === 'function' ? loomyRules.streamAbortFrame : () => undefined
+
+  // F1：root cause —— 路由超时抬到 1 小时（对齐内嵌网关 config.py 的 timeout:3600）
+  {
+    const i = patchSrc.indexOf('- id: loomy2api')
+    const block = i === -1 ? '' : patchSrc.slice(i, patchSrc.indexOf('models:', i))
+    check('F1 loomy2api 路由超时抬到 1 小时', /timeoutMs:\s*3600000/.test(block), block.slice(0, 260))
+  }
+
+  // F2：断流 error 帧翻译成 OpenAI 错误帧
+  const abortFrame = { error: { message: '上游流中断（ConnectionAbortedError）/ upstream stream broken: [WinError 10053] 你的主机中的软件中止了一个已建立的连接。', type: 'upstream_error', code: 504 } }
+  const translated = tbe(abortFrame)
+  check('F2 断流帧被翻译成 upstream_error', translated !== undefined && translated.error && translated.error.type === 'upstream_error' && translated.error.code === 504, JSON.stringify(translated))
+  check('F2 正常 chunk 不误伤', tbe({ choices: [{ index: 0, delta: { content: '1+1=2' } }] }) === undefined)
+  check('F2 无关 error 不误伤', tbe({ error: { message: 'invalid api key', type: 'invalid_request_error', code: 401 } }) === undefined)
+  check('F2 statusForError 断流映射 504', sfe(abortFrame) === 504)
+  check('F2 statusForError 正常帧 undefined', sfe({ choices: [] }) === undefined)
+  check('F2 旧接口 finishReason 不受影响', loomyRules.finishReason('other') === 'stop')
+
+  // F3：纯思考截断流不补 stop —— 规则层策略 + 可扩展钩子
+  check('F3 思考截断 ensureFinishReason=false', loomyRules.ensureFinishReason('spark-x2.6', { sawFinishReason: false, sentAnything: true, sawContent: false, sawToolCall: false }) === false)
+  check('F3 有正文截断 ensureFinishReason=true', loomyRules.ensureFinishReason('spark-x2.6', { sawFinishReason: false, sentAnything: true, sawContent: true, sawToolCall: false }) === true)
+  check('F3 已有 finish_reason ensureFinishReason=true', loomyRules.ensureFinishReason('spark-x2.6', { sawFinishReason: true, sentAnything: true, sawContent: false, sawToolCall: false }) === true)
+  check('F3 不传 meta 保持 true（向后兼容）', loomyRules.ensureFinishReason('spark-x2.6') === true)
+  check('F3 不剥离 reasoning_content', (() => { const d = { reasoning_content: '嗯…', content: null }; loomyRules.normalizeDelta(d); return d.reasoning_content === '嗯…' && d.content === '' })())
+  check('F3 pipeStream 传 meta 给 ensureFinishReason', /ensureFinishReason\(model, meta\)/.test(proxySrc))
+  check('F3 pipeStream 追踪 sawContent/sawToolCall', /sawContent = true/.test(proxySrc) && /sawToolCall = true/.test(proxySrc))
+  check('F3 catch 用 !sawFinishReason', /if \(!sawFinishReason\) \{/.test(proxySrc))
+
+  // F3-扩展：收尾帧文案/判定全部在规则层，框架只剩「问钩子」——这是本次可扩展重构的核心
+  const thinkingMeta = { sawFinishReason: false, sentAnything: true, sawContent: false, sawToolCall: false }
+  const safFrame = saf(thinkingMeta)
+  check('F3 规则层 streamAbortFrame 纯思考返回 upstream_error(504)', safFrame !== undefined && safFrame.error && safFrame.error.type === 'upstream_error' && safFrame.error.code === 504 && /aborted during thinking/.test(safFrame.error.message), JSON.stringify(safFrame))
+  check('F3 规则层 streamAbortFrame 有正文返回 undefined', saf({ sawFinishReason: false, sentAnything: true, sawContent: true, sawToolCall: false }) === undefined)
+  check('F3 规则层 streamAbortFrame 已收 finish_reason 返回 undefined', saf({ sawFinishReason: true, sentAnything: true, sawContent: false, sawToolCall: false }) === undefined)
+  check('F3 规则层 streamAbortFrame 未发任何帧返回 undefined', saf({ sawFinishReason: false, sentAnything: false, sawContent: false, sawToolCall: false }) === undefined)
+  check('F3 文案只在规则层 loomy.mjs', /aborted during thinking/.test(loomySrc))
+  check('F3 框架 proxy.mjs 不再硬编码断流文案', !/aborted during thinking/.test(proxySrc))
+  check('F3 框架 proxy.mjs 定义 streamAbortFrameOf 链助手', /function streamAbortFrameOf\(packs, meta\)/.test(proxySrc))
+  check('F3 框架 proxy.mjs 结尾走 streamAbortFrameOf 钩子', /streamAbortFrameOf\(packs, meta\)/.test(proxySrc))
+  check('F3 registry.mjs 接口文档声明 streamAbortFrame', /streamAbortFrame\(meta\)/.test(registrySrc))
+  check('F3 registry.mjs DEFAULTS 有缺省钩子', /streamAbortFrame: \(\) => undefined/.test(registrySrc))
+
+  // F4：网关把 ConnectionAbortedError 归为客户端断开；qwenpaw 收尾帧需求不回归
+  check('F4 client-disconnect 分支含 ConnectionAbortedError', /except \(BrokenPipeError, ConnectionResetError, ConnectionAbortedError\)/.test(serverSrc2))
+  check('F4 上游真断流仍发收尾帧 [DONE]', /data: \[DONE\]/.test(serverSrc2) && /upstream_error/.test(serverSrc2))
+
+  // 集成：真实起 proxy，喂两种截断流，断言「错误帧 + 不伪造 stop」
+  const { createProxy } = await import('../lib/proxy.mjs')
+  const { RuleRegistry } = await import('../lib/registry.mjs')
+  const NL = String.fromCharCode(10)
+  const sse = (frames) => frames.map((f) => 'data: ' + f + NL + NL).join('')
+  const think1 = JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: '嗯，用户让我' } }] })
+  const think2 = JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: '先读文件 <acp_read_files>...' } }] })
+  const errFrame = JSON.stringify(abortFrame)
+  const scenarios = [
+    { name: '带 error 帧的断流', frames: [think1, think2, errFrame, '[DONE]'] },
+    { name: '纯思考 EOF（无 error 帧）', frames: [think1, think2] },
+  ]
+  const realFetch = globalThis.fetch
+  for (const s of scenarios) {
+    const registry = new RuleRegistry()
+    registry.register(loomyRules)
+    globalThis.fetch = async () => new Response(sse(s.frames), { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } })
+    let proxy
+    try {
+      proxy = createProxy({ port: 0, autoLaunch: false, registry, routes: [{ id: 'loomy2api', upstream: 'http://127.0.0.1:17890/v1', apiKey: 'sk-loomy-local', rules: ['loomy2api'], timeoutMs: 3600000 }] })
+      await proxy.ready
+      const res = await realFetch(proxy.origin() + '/loomy2api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer sk-loomy-local', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'spark-x2.6', stream: true, messages: [{ role: 'user', content: 'x' }] }),
+      })
+      const out = await res.text()
+      check('集成[' + s.name + '] 发 upstream_error 帧', out.includes('"type":"upstream_error"'), out.slice(0, 240))
+      check('集成[' + s.name + '] 不伪造 finish_reason', !out.includes('finish_reason'), out.slice(0, 240))
+      check('集成[' + s.name + '] 有 [DONE] 收尾', out.includes('[DONE]'))
+    } catch (error) {
+      check('集成[' + s.name + '] 无异常', false, String((error && error.stack) || error))
+    } finally {
+      globalThis.fetch = realFetch
+      if (proxy) {
+        try { await Promise.race([proxy.close(), new Promise((r) => setTimeout(r, 1500))]) } catch {}
+      }
+    }
+  }
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed')
 process.exit(failures === 0 ? 0 : 1)

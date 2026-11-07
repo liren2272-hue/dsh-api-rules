@@ -267,6 +267,15 @@
               - loomy2api
             concurrency: 4
             sessionHoldMs: 60000
+            # spark-x2.6 长思考流（10万+ token 上下文）常超规则层默认 120s 的
+            # AbortSignal.timeout，把响应体掐断 → 网关 10053 → 只剩思考的截断流被补成
+            # finish_reason:'stop'（用户看到「把思考当结果输出」）。
+            # 对齐内嵌网关自己的兜底：vendor config.py 的 "timeout": 3600 注释写明
+            # 「1200s 只够 ~36K token@30tok/s — 提到 3600s 一小时兜底」。600s 比之
+            # 更短，仍会截掉长任务；这里抬到 1 小时。真正的「卡死」保护由网关的
+            # stream_idle_timeout（单次 read 无数据 120s 判死）+ 客户端断开信号承担，
+            # 总时长上限只需宽松到不误杀合法长流即可。
+            timeoutMs: 3600000
             launch:
               # 用内嵌 .venv 的 python，不依赖用户全局 python 的版本/位置。
               command: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\loomy2api\\.venv\\Scripts\\python.exe"
