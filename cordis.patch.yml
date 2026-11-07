@@ -391,45 +391,33 @@
                 input:
                   - text
                   - image
-              - id: Qwen3.8-Max
+              - id: Cantus
                 contextWindow: 180000
                 maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Qwen3.8-Flash
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Qwen3.7-Max
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Qwen3.7-Plus
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Qwen3.7-Flash
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: DeepSeek-V4-Pro
-                contextWindow: 96000
-                maxTokens: 96000
                 input:
                   - text
                   - image
               - id: DeepSeek-Flash
-                contextWindow: 180000
-                maxTokens: 180000
+                contextWindow: 1000000
+                maxTokens: 1000000
+                input:
+                  - text
+                  - image
+              - id: DeepSeek-V4-Pro
+                contextWindow: 1000000
+                maxTokens: 1000000
+                input:
+                  - text
+                  - image
+              - id: Efficient
+                contextWindow: 200000
+                maxTokens: 200000
+                input:
+                  - text
+                  - image
+              - id: Fast
+                contextWindow: 200000
+                maxTokens: 200000
                 input:
                   - text
                   - image
@@ -445,34 +433,54 @@
                 input:
                   - text
                   - image
-              - id: GLM-5.2
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Kimi-K3
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
               - id: Kimi-K2.8-Preview
+                contextWindow: 200000
+                maxTokens: 200000
+                input:
+                  - text
+                  - image
+              - id: Kimi-K3.1-Pro
                 contextWindow: 180000
                 maxTokens: 180000
                 input:
                   - text
                   - image
-              - id: MiniMax-M2.7
+              - id: MiniMax-M3.1-Flash
                 contextWindow: 180000
                 maxTokens: 180000
+                input:
+                  - text
+                  - image
               - id: QoDuck
                 contextWindow: 180000
                 maxTokens: 180000
                 input:
                   - text
                   - image
-
+              - id: Qwen3.8-Flash
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Qwen3.8-Max
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Sonus
+                contextWindow: 180000
+                maxTokens: 180000
+                input:
+                  - text
+                  - image
+              - id: Ultimate
+                contextWindow: 1000000
+                maxTokens: 1000000
+                input:
+                  - text
+                  - image
 # ---------------------------------------------------------------------------
 # DSH 侧的 provider 注册 —— 与上面同一个插件，跟随插件一起安装。
 #
@@ -927,14 +935,14 @@
         baseURL: http://127.0.0.1:8788/qoder2api-hub/v1
         models:
           - id: Auto
-            name: Auto（上游自动选模型）
+            name: Auto
             contextWindow: 200000
             maxTokens: 200000
             input:
               - text
               - image
-          - id: Qwen3.8-Max
-            name: Qwen3.8-Max
+          - id: Cantus
+            name: Cantus
             contextWindow: 180000
             maxTokens: 180000
             input:
@@ -943,6 +951,110 @@
             reasoningEfforts:
               low: low
               medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: DeepSeek-Flash
+            name: DeepSeek-Flash
+            contextWindow: 1000000
+            maxTokens: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: DeepSeek-V4-Pro
+            name: DeepSeek-V4-Pro
+            contextWindow: 1000000
+            maxTokens: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              high: high
+              max: max
+          - id: Efficient
+            name: Efficient
+            contextWindow: 200000
+            maxTokens: 200000
+            input:
+              - text
+              - image
+          - id: Fast
+            name: Fast
+            contextWindow: 200000
+            maxTokens: 200000
+            input:
+              - text
+              - image
+          - id: GLM-5.3
+            name: GLM-5.3
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: GLM-5.3-Flash
+            name: GLM-5.3-Flash
+            contextWindow: 1000000
+            maxTokens: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              high: high
+              max: max
+          - id: Kimi-K2.8-Preview
+            name: Kimi-K2.8-Preview
+            contextWindow: 200000
+            maxTokens: 200000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: Kimi-K3.1-Pro
+            name: Kimi-K3.1-Pro
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
+          - id: MiniMax-M3.1-Flash
+            name: MiniMax-M3.1-Flash
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: QoDuck
+            name: QoDuck
+            contextWindow: 180000
+            maxTokens: 180000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
               xhigh: xhigh
           - id: Qwen3.8-Flash
             name: Qwen3.8-Flash
@@ -955,38 +1067,8 @@
               low: low
               medium: medium
               xhigh: xhigh
-          - id: Qwen3.7-Max
-            name: Qwen3.7-Max
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-          - id: Qwen3.7-Plus
-            name: Qwen3.7-Plus
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-          - id: Qwen3.7-Flash
-            name: Qwen3.7-Flash
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-          - id: DeepSeek-V4-Pro
-            name: DeepSeek-V4-Pro
-            contextWindow: 96000
-            maxTokens: 96000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              high: high
-          - id: DeepSeek-Flash
-            name: DeepSeek-Flash
+          - id: Qwen3.8-Max
+            name: Qwen3.8-Max
             contextWindow: 180000
             maxTokens: 180000
             input:
@@ -994,9 +1076,10 @@
               - image
             reasoningEfforts:
               low: low
-              high: high
-          - id: GLM-5.3
-            name: GLM-5.3
+              medium: medium
+              xhigh: xhigh
+          - id: Sonus
+            name: Sonus
             contextWindow: 180000
             maxTokens: 180000
             input:
@@ -1004,58 +1087,20 @@
               - image
             reasoningEfforts:
               low: low
+              medium: medium
               high: high
-          - id: GLM-5.3-Flash
-            name: GLM-5.3-Flash
+              xhigh: xhigh
+              max: max
+          - id: Ultimate
+            name: Ultimate
             contextWindow: 1000000
             maxTokens: 1000000
             input:
               - text
               - image
             reasoningEfforts:
-              high: high
-          - id: GLM-5.2
-            name: GLM-5.2
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              high: high
-          - id: Kimi-K3
-            name: Kimi-K3
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
               low: low
-              high: high
-          - id: Kimi-K2.8-Preview
-            name: Kimi-K2.8-Preview
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              high: high
-          - id: MiniMax-M2.7
-            name: MiniMax-M2.7
-            contextWindow: 180000
-            maxTokens: 180000
-          - id: QoDuck
-            name: QoDuck
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
+              medium: medium
               high: high
               xhigh: xhigh
-
+              max: max
