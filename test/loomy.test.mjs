@@ -4,8 +4,9 @@
  * 覆盖几件事：
  *  1. loomy 路由的 normalizeRoute 正确规整 launch（command/args/cwd/env/readyUrl），
  *     且 env 里钉死的网关 key 能存活下来（这是「首次启动随机 key 只打印一次」的对策）；
- *  2. loomyRules 的请求整形：剥离 reasoning/reasoning_effort/thinking、把
- *     max_completion_tokens/max_output_tokens 归一到 max_tokens；
+ *  2. loomyRules 的请求整形：剥离 reasoning/thinking、把
+ *     max_completion_tokens/max_output_tokens 归一到 max_tokens；**保留 reasoning_effort**
+ *     （vendored loomy2api 读它并透传上游，是思考强度档位的唯一载体）；
  *  3. **决定性修复**：给 tools 里不合规的「裸属性表」parameters 补上标准
  *     {type:object, properties} 外壳——根级 `type` 键正是 spark-x2.6 确定性 400
  *     「请求有误…iflytek-spark-loomy」的触发点（与 officeace.mjs 同类）；
@@ -87,7 +88,7 @@ function equal(name, actual, expected) {
   }
   const { notes } = loomyRules.normalizeRequest({ body })
   check('loomy 剥离了 reasoning', !('reasoning' in body), notes.join(','))
-  check('loomy 剥离了 reasoning_effort', !('reasoning_effort' in body))
+  check('loomy 保留 reasoning_effort（上游思考强度档位）', body['reasoning_effort'] === 'high')
   check('loomy 剥离了 thinking', !('thinking' in body))
   // 三者同时出现取最小：min(1000, 2048, 3000) = 1000
   equal('loomy 归一 max_tokens = min', body['max_tokens'], 1000)

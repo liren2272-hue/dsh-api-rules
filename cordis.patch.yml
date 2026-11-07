@@ -291,6 +291,9 @@
             # 上游那 3 个 type=image 的生图模型（Hy-Image-3.5-preview / doubao-seedream-5-lite /
             # qwen-image-3.0-pro）**不进本清单**：它们只认 /v1/images/generations，打 chat 端点会 400/404。
             # 模型选择器里显示哪些由下面 llm-pi-ai 那段决定，增删模型时两处必须一起改。
+            # 注意：上游 capabilities.vision 会骗人。deepseek-v4-flash-0731 上游标 vision=false，
+            # 但实测直发图片能准确读出图内文字（2026-11-06 用测试图验证两次），故按视觉模型声明。
+            # 反向已验证确无视觉：spark-x2.6（回"无法查看图片"）、qwen-3.8-max（上游 400）。
             models:
               - id: spark-x2.6
                 contextWindow: 1048576
@@ -304,15 +307,6 @@
               - id: deepseek-v4-flash-0731
                 contextWindow: 1048576
                 maxTokens: 384000
-              - id: MiniMax-M3
-                contextWindow: 1048576
-                maxTokens: 512000
-                input:
-                  - text
-                  - image
-              - id: Kimi-k2.6
-                contextWindow: 262144
-                maxTokens: 65536
                 input:
                   - text
                   - image
@@ -363,6 +357,17 @@
   name: '@deepseek-ai/dsh-llm-pi-ai'
   config:
     providers:
+      # reasoningEfforts：模型选择器「思考强度」档位 → 上游 wire 值的映射。档位取自 pi-ai 的
+      # THINKING_LEVELS（off/minimal/low/medium/high/xhigh/max）；只有声明了 reasoningEfforts 的
+      # 模型，UI 上才会出现强度菜单（pi-ai 的 reasoningInfo() 对 reasoning=false 的模型返回 {}）。
+      # 两个刻意的取舍：
+      #   1. 一律不声明 off：用户不选档时 pi-ai 不下发 reasoning_effort，由上游用自己的默认值决定。
+      #      一旦声明 off 为某个 wire 值，pi-ai 会在所有请求里强制带上它（openai 分支的 offValue 逻辑），
+      #      把上游默认（思考开）改成显式关闭，行为会变。
+      #   2. 上游的 "none"（= 关闭思考）不是 pi-ai 档位名，无法作为档位声明；要关闭思考请走 provider
+      #      default，不要声明 off=none。glm-5.1 / kimi-k2.6 / deepseek-v4-flash 连 none 都不接受，
+      #      声明了只会 400。
+      # 每个模型的可取档位以本机实测为准（见各 provider 的探针注释）。
       codearts:
         apiKeyEnv: API_RULES_BEARER
         api: openai-completions
@@ -371,6 +376,14 @@
           - id: GLM-5.2
             name: GLM-5.2
             maxTokens: 65536
+            # 华为 ModelArts 直连（无网关剥离）：[minimal, low, medium, high, xhigh, max]
+            reasoningEfforts:
+              minimal: minimal
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: glm-5.2-sft-harmony
             name: GLM-5.2-SFT-Harmony
             maxTokens: 131072
@@ -383,9 +396,20 @@
           - id: glm-5.3
             name: GLM-5.3
             maxTokens: 65536
+            # 华为文档 GLM-5.3 只给 max / high(deep) / low(enhanced)
+            reasoningEfforts:
+              max: max
+              high: high
+              low: low
           - id: deepseek-v4.1-flash
             name: DeepSeek-V4.1-Flash
             maxTokens: 65536
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: kimi-k3
             name: Kimi-K3
             maxTokens: 65536
@@ -394,24 +418,68 @@
         api: openai-completions
         baseURL: http://127.0.0.1:8788/officeace/v1
         models:
+          # 华为 ModelArts，经本插件 vendor/officeace2api 网关转发。网关在 stripThinking
+          # 时才会剥掉 reasoning_effort；对下列「会校验」的模型，网关原样透传。
+          # 注意 glm-5.3 被网关剥掉（实测 invalid 值也返回 200），故不声明强度档。
           - id: deepseek-v4-flash
             name: DeepSeek-V4-Flash
             maxTokens: 65536
+            # 实测 400：reasoning_effort must be [low, medium, high, xhigh, max]（不接受 none）
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: deepseek-v4-flash-0731
             name: DeepSeek-V4-Flash-0731
             maxTokens: 65536
+            # 实测接受 none / low / medium / high / xhigh / max（none 走 off 档，未声明以免覆盖上游默认）
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: deepseek-v4.1-flash
             name: DeepSeek-V4.1-Flash
             maxTokens: 65536
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: deepseek-v4.1-flash-0930
             name: DeepSeek-V4.1-Flash-0930
             maxTokens: 65536
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: glm-5.1
             name: GLM-5.1
             maxTokens: 65536
+            # 实测 400：reasoning_effort must be [low, medium, high, xhigh, max]
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: glm-5.2
             name: GLM-5.2
             maxTokens: 65536
+            # 实测 400：reasoning_effort must be [minimal, low, medium, high, xhigh, max]（none 走 off 档，未声明）
+            reasoningEfforts:
+              minimal: minimal
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: glm-5.2-zx
             name: GLM-5.2-ZX
             maxTokens: 65536
@@ -424,6 +492,13 @@
           - id: kimi-k2.6
             name: Kimi-K2.6
             maxTokens: 65536
+            # 实测 400：reasoning_effort must be [low, medium, high, xhigh, max]
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: kimi-k3
             name: Kimi-K3
             maxTokens: 65536
@@ -434,55 +509,52 @@
             name: Qwen3-32B
             maxTokens: 65536
       # cline（cline2api）：baseURL 指向本插件 8788 上的 /cline/v1 路由，
-      # 该路由在插件启动时自动拉起 cline2api（默认 :3457）。模型以 cline2api 实时同步的
-      # 清单为准；下面这些是常用回退条目。apiKeyEnv 同样是占位 bearer（见上方头注释）。
+      # 该路由在插件启动时自动拉起 cline2api（默认 :3457）。apiKeyEnv 同样是占位 bearer
+      # （见上方头注释）。
+      #
+      # 这里只声明当前账号有权限的 3 个免费模型（cline-pass / anthropic / openai /
+      # moonshotai 各档都没有权限，选了会报 model ... is disabled）。
       cline:
         apiKeyEnv: API_RULES_BEARER
         api: openai-completions
         baseURL: http://127.0.0.1:8788/cline/v1
         models:
+          - id: cline-free/nemotron-3.5-super-vl
+            name: Cline Free Nemotron 3.5 Super VL
+            maxTokens: 65536
+            # cline2api 上游（Vercel / Openrouter 等）接受 none/minimal/low/medium/high/xhigh/max；
+            # 不声明 off：未选档时 pi-ai 不下发，由上游默认决定。
+            reasoningEfforts:
+              minimal: minimal
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: cline-free/solar-mini4
             name: Cline Free Solar Mini 4
             maxTokens: 65536
-          - id: cline-pass/deepseek-v4.1-flash
-            name: Cline DeepSeek V4.1 Flash
+            # cline2api 上游（Vercel / Openrouter 等）接受 none/minimal/low/medium/high/xhigh/max；
+            # 不声明 off：未选档时 pi-ai 不下发，由上游默认决定。
+            reasoningEfforts:
+              minimal: minimal
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: nvidia/nemotron-3.5-lightning-free
+            name: Nvidia Nemotron 3.5 Lightning Free
             maxTokens: 65536
-          - id: cline-pass/deepseek-v4.1-flash-1017
-            name: Cline DeepSeek V4.1 Flash 1017
-            maxTokens: 65536
-          - id: cline-pass/kimi-k3
-            name: Cline Kimi K3
-            maxTokens: 65536
-          - id: cline-pass/glm-5.3
-            name: Cline GLM-5.3
-            maxTokens: 65536
-          - id: cline-pass/qwen3.7-max
-            name: Cline Qwen3.7 Max
-            maxTokens: 65536
-          - id: cline-pass/qwen3.7-plus
-            name: Cline Qwen3.7 Plus
-            maxTokens: 65536
-          - id: cline-pass/minimax-m3
-            name: Cline MiniMax M3
-            maxTokens: 65536
-          - id: anthropic/claude-sonnet-5.5
-            name: Claude Sonnet 5.5
-            maxTokens: 65536
-          - id: anthropic/claude-opus-5.5
-            name: Claude Opus 5.5
-            maxTokens: 65536
-          - id: google/gemini-4-argon
-            name: Gemini 4 Argon
-            maxTokens: 65536
-          - id: openai/gpt-6-astra
-            name: GPT-6 Astra
-            maxTokens: 65536
-          - id: openai/gpt-6.1-sol
-            name: GPT-6.1 Sol
-            maxTokens: 65536
-          - id: moonshotai/kimi-k3
-            name: Moonshot Kimi K3
-            maxTokens: 65536
+            # cline2api 上游（Vercel / Openrouter 等）接受 none/minimal/low/medium/high/xhigh/max；
+            # 不声明 off：未选档时 pi-ai 不下发，由上游默认决定。
+            reasoningEfforts:
+              minimal: minimal
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
       # raccoon（raccoon2api）：baseURL 指向本插件 8788 上的 /raccoon/v1 路由，
       # 该路由在插件启动时自动拉起 CLIProxyAPI（默认 :8317）。模型 id 带 `raccoon/` 前缀。
       #
@@ -499,10 +571,22 @@
             name: Raccoon-Work-260817-A
             contextWindow: 1000000
             maxTokens: 100000
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
           - id: raccoon/raccoon-405a1c
             name: Raccoon-Work-260817-B
             contextWindow: 1000000
             maxTokens: 100000
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
           - id: raccoon/raccoon-8c4485
             name: Raccoon-Work
             contextWindow: 1000000
@@ -510,6 +594,12 @@
             input:
               - text
               - image
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
           - id: raccoon/sn-deepseek-v4-1-flash-1017
             name: DeepSeek-V4.1-Flash-1017
             contextWindow: 1000000
@@ -517,10 +607,22 @@
             input:
               - text
               - image
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
           - id: raccoon/sn-glm-5-3
             name: GLM-5-3
             contextWindow: 1000000
             maxTokens: 100000
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
           - id: raccoon/sn-glm-5-3-flash
             name: GLM-5-3-Flash
             contextWindow: 1000000
@@ -528,6 +630,12 @@
             input:
               - text
               - image
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
           - id: raccoon/sn-kimi-k3
             name: Kimi-K3
             contextWindow: 1000000
@@ -535,6 +643,12 @@
             input:
               - text
               - image
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
           - id: raccoon/sn-sensenova-6-8-flash
             name: SenseNova-6.8-Flash
             contextWindow: 256000
@@ -542,6 +656,12 @@
             input:
               - text
               - image
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
           - id: raccoon/sn-sensenova-6-8-flash-lite
             name: SenseNova-6.8-Flash-Lite
             contextWindow: 256000
@@ -550,6 +670,12 @@
               - text
               - image
 
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
       # loomy（loomy2api）：baseURL 指向本插件 8788 上的 /loomy/v1 路由，
       # 该路由在插件启动时自动拉起内嵌的 vendor/loomy2api（默认 :17890）。
       #
@@ -567,10 +693,17 @@
         models:
           # 实测自本机 loomy2api /v1/models 的 live catalogue。maxTokens=上游 max_output_tokens，
           # contextWindow=上游 context_length；vision=T 才标 input:[text,image]。3 个生图模型不进本清单。
+          # 强度档位取自上游逐模型暴露的 reasoning_efforts：[low, medium, high, xhigh]（none 走 off 档，未声明）；
+          # qwen-3.8-max 上游未给该字段，auto 是动态路由，两者都不声明。
           - id: spark-x2.6
             name: Spark-X2.6
             contextWindow: 1048576
             maxTokens: 131072
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
           - id: DeepSeek-V4.1-Flash
             name: DeepSeek-V4.1-Flash
             contextWindow: 1048576
@@ -578,24 +711,23 @@
             input:
               - text
               - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
           - id: deepseek-v4-flash-0731
             name: DeepSeek-V4-Flash-0731
             contextWindow: 1048576
             maxTokens: 384000
-          - id: MiniMax-M3
-            name: MiniMax-M3
-            contextWindow: 1048576
-            maxTokens: 512000
             input:
               - text
               - image
-          - id: Kimi-k2.6
-            name: Kimi-K2.6
-            contextWindow: 262144
-            maxTokens: 65536
-            input:
-              - text
-              - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
           - id: qwen-3.8-max
             name: Qwen-3.8-Max
             contextWindow: 1000000
@@ -607,6 +739,11 @@
             input:
               - text
               - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
           - id: qwen3.8-flash
             name: Qwen3.8-Flash
             contextWindow: 1000000
@@ -614,6 +751,11 @@
             input:
               - text
               - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
           - id: mimo-v2.5
             name: MiMo-V2.5
             contextWindow: 1048576
@@ -621,6 +763,11 @@
             input:
               - text
               - image
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
           - id: auto
             name: Auto（上游自动选模型）
             maxTokens: 65536

@@ -12,7 +12,8 @@
  *  2. 裸属性表被补成合规外壳，参数名/定义一个不少，名为 `type` 的普通参数
  *     （all/journal/thesis）作为 properties 里的普通属性保留并带 enum；
  *  3. 已合规的 object schema 逐字节不动（不做无谓重写）、净化幂等；
- *  4. 通用归一（删 reasoning/thinking、max_tokens 取最小）与 generic 包等价；
+ *  4. 通用归一（删 reasoning/thinking、保留 reasoning_effort、max_tokens 取最小）与
+ *     generic 包等价；
  *  5. 不引入 codearts 那套并发闸门 / 退避（officeace 无并发上限）。
  *
  * 不连真实上游。运行：node test/officeace.test.mjs
@@ -124,6 +125,8 @@ function fixtureTools() {
 
   check('返回 { body, notes }', res && typeof res.body === 'object' && Array.isArray(res.notes))
   check('notes 记录补壳数量', /wrapped 3 /.test(res.notes.join(' ')), JSON.stringify(res.notes))
+  // reasoning_effort 是华为 ModelArts 的思考强度档位（经网关透传），不能再被剥离。
+  equal('officeace 保留 reasoning_effort', res.body['reasoning_effort'], 'high')
   equal('工具数量不变', res.body.tools.length, tools.length)
 
   // 合规 schema 逐字节不动
@@ -159,7 +162,7 @@ function fixtureTools() {
 
 // ------------------------------------------------- 3. 与 generic 的等价性（无 tools）
 {
-  const mk = () => ({ max_tokens: 50, max_completion_tokens: 80, reasoning: true, thinking: 'x', messages: [] })
+  const mk = () => ({ max_tokens: 50, max_completion_tokens: 80, reasoning: true, thinking: 'x', reasoning_effort: 'high', messages: [] })
   const g = genericRules.normalizeRequest({ body: mk() })
   const o = officeaceRules.normalizeRequest({ body: mk() })
   equal('无 tools 时与 generic 等价', JSON.stringify(o.body), JSON.stringify(g.body))
