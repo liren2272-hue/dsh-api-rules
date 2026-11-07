@@ -406,5 +406,88 @@ function cleanTool(name) {
   }
 }
 
+// ------------------------------------------------- 思考死循环检测（2026-11-08）
+// spark-x2.6 推理不收敛：reasoning_content 无限生成直到把 max_tokens 预算耗尽
+// （实测两次 955s / 输出恰好 131072，content 为空）。规则层 thinkingLimitFrame
+// 两级判定：尾部 1000 字窗内同一 24 字 n-gram 出现 > 8 次；或思考帧数 > 6000 仍无正文。
+{
+  const tlf = (meta) => loomyRules.thinkingLimitFrame(meta)
+
+  // 1) 尾部重复命中：尾部窗内同一 24 字片段反复出现（loopUnit 26 字，repeat 40）
+  const loopUnit = '用户让我读一下这个文件的内容然后再决定下一步应该怎么做。' // 26 字
+  const repeatedTail = '嗯，用户的问题是这样的，我需要仔细分析。'.padEnd(200, '。') + loopUnit.repeat(40)
+  const rep = tlf({ reasoningText: repeatedTail, reasoningChunks: 50 })
+  check('死循环[重复] 命中返回帧', rep !== undefined && rep.choices?.[0]?.finish_reason === 'length', JSON.stringify(rep)?.slice(0, 200))
+  check('死循环[重复] 标记 reason=repetition', rep?._thinking_loop?.reason === 'repetition', JSON.stringify(rep?._thinking_loop))
+
+  // 2) 停滞兜底：帧数超 6000、无重复文本
+  const stagn = tlf({ reasoningText: '正常思考'.padEnd(100, '随机'), reasoningChunks: 6001 })
+  check('死循环[停滞] 帧数>6000 命中', stagn !== undefined && stagn.choices?.[0]?.finish_reason === 'length', JSON.stringify(stagn)?.slice(0, 200))
+  check('死循环[停滞] 标记 reason=stagnation', stagn?._thinking_loop?.reason === 'stagnation', JSON.stringify(stagn?._thinking_loop))
+
+  // 3) 不误杀：短思考、无重复
+  check('死循环[正常短思考] 不命中', tlf({ reasoningText: '嗯，用户让我先读文件。', reasoningChunks: 5 }) === undefined)
+  // 4) 不误杀：长思考但真正不重复（每 24 字窗口含递增计数器与变化词，尾窗内 n-gram 各只出现 1 次）
+  let varied = ''
+  const verbs = ['拆解', '检索', '比对', '归纳', '验证', '推翻', '重构', '收敛']
+  const objs = ['问题边界', '隐含前提', '反例', '成本', '时序依赖', '接口契约', '边界条件', '解空间']
+  for (let i = 0; i < 200; i++) {
+    varied += `【${i}】${verbs[i % 8]}${objs[(i * 3) % 8]}，结合上文第${i - 1}条与第${i - 2}条，判断是否需要回溯。`
+  }
+  check('死循环[长而不重复] 不命中', tlf({ reasoningText: varied, reasoningChunks: 3000 }) === undefined, '误杀合法长思考')
+  // 5) meta 缺省不抛
+  check('死循环[空 meta] 不命中且不抛', tlf({}) === undefined && tlf(undefined) === undefined)
+
+  // E2E：真实起 proxy，喂一段「思考重复」流，断言中途被 finish_reason:length 终止。
+  // 对照：正常短思考流完整跑完、由上游 finish_reason 收尾。
+  const { createProxy } = await import('../lib/proxy.mjs')
+  const { RuleRegistry } = await import('../lib/registry.mjs')
+  const NL2 = String.fromCharCode(10)
+  const sse2 = (frames) => frames.map((f) => 'data: ' + f + NL2 + NL2).join('')
+  const realFetch2 = globalThis.fetch
+
+  async function runStream(frames) {
+    const registry = new RuleRegistry()
+    registry.register(loomyRules)
+    globalThis.fetch = async () => new Response(sse2(frames), { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } })
+    let proxy
+    try {
+      proxy = createProxy({ port: 0, autoLaunch: false, registry, routes: [{ id: 'loomy2api', upstream: 'http://127.0.0.1:17890/v1', apiKey: 'sk-loomy-local', rules: ['loomy2api'], timeoutMs: 3600000 }] })
+      await proxy.ready
+      const res = await realFetch2(proxy.origin() + '/loomy2api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer sk-loomy-local', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'spark-x2.6', stream: true, messages: [{ role: 'user', content: 'x' }] }),
+      })
+      return await res.text()
+    } finally {
+      globalThis.fetch = realFetch2
+      if (proxy) { try { await Promise.race([proxy.close(), new Promise((r) => setTimeout(r, 1500))]) } catch {} }
+    }
+  }
+
+  try {
+    // 死循环流：40 个重复思考 chunk（每个都带同一段 24+ 字重复），无 content/finish_reason
+    const loopChunk = JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: loopUnit } }] })
+    const loopOut = await runStream(Array(40).fill(loopChunk))
+    check('E2E[死循环] 以 finish_reason:length 终止', loopOut.includes('"finish_reason":"length"'), loopOut.slice(0, 240))
+    check('E2E[死循环] 有 [DONE] 收尾', loopOut.includes('[DONE]'))
+    check('E2E[死循环] 不补合成 stop（不是伪装正常完成）', !loopOut.includes('"finish_reason":"stop"'), loopOut.slice(0, 240))
+
+    // 正常流：短思考 + 正文 + 上游 stop，不应被误杀
+    const normalOut = await runStream([
+      JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: '嗯，用户让我先读文件。' } }] }),
+      JSON.stringify({ choices: [{ index: 0, delta: { content: '好的，这是结果。' } }] }),
+      JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+      '[DONE]',
+    ])
+    check('E2E[正常] 不误杀（保留上游 stop）', normalOut.includes('"finish_reason":"stop"'), normalOut.slice(0, 240))
+    check('E2E[正常] 正文保留', normalOut.includes('好的，这是结果。'))
+    check('E2E[正常] 无 length 截断', !normalOut.includes('"finish_reason":"length"'), normalOut.slice(0, 240))
+  } catch (error) {
+    check('E2E[死循环/正常] 无异常', false, String((error && error.stack) || error))
+  }
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed')
 process.exit(failures === 0 ? 0 : 1)
