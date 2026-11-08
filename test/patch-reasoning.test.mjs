@@ -47,6 +47,45 @@ const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhi
 //   raccoon/*                              -> [low, medium, high]
 //     （raccoon2api 插件归一化：off/none/minimal -> low；GLM/Kimi 的 medium -> high）
 const EXPECTED = new Map([
+  // 2026-11-08 17:11 探针（tmp/probe-all-efforts.json）在 8788 上实测：
+  // qoder2api-hub 的 Auto / Efficient / Fast 五个档位返回 200（Auto 的 max 那次 400，
+  // 其余档位 200），loomy2api 的 qwen-3.8-max / auto 也补了声明。这五条曾经在
+  // FORBIDDEN 里（「无思考配置，不声明」），补声明后白名单必须同步，否则本测试会红。
+  ['loomy2api/qwen-3.8-max', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['loomy2api/auto', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['qoder2api-hub/Auto', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['qoder2api-hub/Efficient', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['qoder2api-hub/Fast', ['low', 'medium', 'high', 'xhigh', 'max']],
+  // 2026-11-09 minimax2api（MiniMax Agent 官方客户端网关，:8080）：
+  // 它不认 OpenAI 的 reasoning_effort 档位，只认布尔 `thinking`；规则层
+  // （lib/rules/minimax2api.mjs:112-118）把任何非 off/none/disabled/minimal 的档位
+  // 一律翻成 thinking:true，而 m3.1-flash 是 forced_on（忽略入参恒开思考）、
+  // m3 是 switchable（按布尔发 thinking）。也就是说五档对它全部合法、语义等价，
+  // 声明出来只是让选择器能列档，不会产生 400 —— 所以按五档声明。
+  ['minimax2api/minimax-m3.1-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['minimax2api/minimax-m3', ['low', 'medium', 'high', 'xhigh', 'max']],
+  // 2026-11-09 trae2api-hub（:8791，trae_proxy.py:1.4.3）：
+  // 网关原生处理 reasoning_effort（低/中/高/超高/最高五档直接透传给上游的
+  // parameters.reasoning_effort，见 trae_proxy.py:3812 normalize_reasoning_effort），
+  // 五档对 trae 模型全部合法、语义等价，声明出来让选择器能列档，不会产生 400。
+  ['trae2api-hub/Seed-Code', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Kimi-K3', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/DeepSeek-V4-Flash', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/DeepSeek-V4-Pro', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/GLM-5.3', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Qwen3.8-Max', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Kimi-K2.8-Preview', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/MiniMax-M3', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Seed-2.1-Pro-0915', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/DeepSeek-V3.1-Terminus', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Claude-Opus-4.7', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Claude-Sonnet-4.6', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/GPT-5.5', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/GPT-6-Astra', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Gemini-2.5-Pro', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Gemini-3.1-Pro-Preview', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Grok-4', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['trae2api-hub/Kimi-K2-0905', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['codearts/GLM-5.2', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['codearts/glm-5.3', ['low', 'high', 'max']],
   ['codearts/deepseek-v4.1-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
@@ -120,10 +159,10 @@ const EXPECTED = new Map([
 const FORBIDDEN = [
   // officeace：经 8788 路由实测 404（网关不转发 / 上游不提供），无强度档可言。
   'officeace/glm-5.2-zx', 'officeace/glm-5.3-zx',
-  // loomy2api：qwen-3.8-max 上游未给档位字段；auto 是动态路由，档位不定。
-  'loomy2api/qwen-3.8-max', 'loomy2api/auto',
-  // qoder2api-hub：无思考配置的模型一律不声明（声明了选择器会出档位菜单、上游却认不了）。
-  'qoder2api-hub/Auto', 'qoder2api-hub/Efficient', 'qoder2api-hub/Fast',
+  // minimax2api/minimax-agent：网关里它没有 modelSelection 条目（既非 forced_on 也非
+  // switchable，见 lib/rules/minimax2api.mjs:29-38），thinking 入参对它无意义，
+  // 所以 cordis.patch.yml 不给它声明 reasoningEfforts；列在这里把「故意不声明」固化下来。
+  'minimax2api/minimax-agent',
 ]
 
 let failures = 0

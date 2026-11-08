@@ -489,5 +489,133 @@ function cleanTool(name) {
   }
 }
 
+
+// —————————————————————————————————————————————————————————————————————————————
+// 正文混入伪工具调用标记（spark-x2.6 工具调用格式退化）——回归
+// 现象：长上下文 + xhigh 档下偶发把结构化 tool_calls 写成正文里的 XML 草稿，
+//       还带正常 finish_reason:'stop' 收尾，agent 不执行任何工具直接停住。
+// 修复：loomy 规则包新增 isIncompleteTurn / incompleteTurnMessages /
+//       maxIncompleteTurnRetries 三个可选钩子，复用 proxy.mjs 的续推链重发一次。
+// —————————————————————————————————————————————————————————————————————————————
+{
+  const NL3 = String.fromCharCode(10)
+  const sse3 = (frames) => frames.map((f) => 'data: ' + f + NL3 + NL3).join('')
+  const realFetch3 = globalThis.fetch
+  const delta = (obj) => JSON.stringify({ choices: [{ index: 0, delta: obj }] })
+  const finish = (reason) => JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: reason }] })
+
+  async function runDraftStream(framesPerCall, clientBody) {
+    const { createProxy } = await import('../lib/proxy.mjs')
+    const { RuleRegistry } = await import('../lib/registry.mjs')
+    const registry = new RuleRegistry()
+    registry.register(loomyRules)
+    const calls = []
+    let callIndex = 0
+    globalThis.fetch = async (url, init) => {
+      const body = JSON.parse(String(init.body))
+      calls.push(body)
+      const frames = framesPerCall[Math.min(callIndex, framesPerCall.length - 1)]
+      callIndex += 1
+      return new Response(sse3(frames), { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } })
+    }
+    let proxy
+    try {
+      proxy = createProxy({ port: 0, autoLaunch: false, registry, routes: [{ id: 'loomy2api', upstream: 'http://127.0.0.1:17890/v1', apiKey: 'sk-loomy-local', rules: ['loomy2api'], timeoutMs: 3600000 }] })
+      await proxy.ready
+      const res = await realFetch3(proxy.origin() + '/loomy2api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer sk-loomy-local', 'Content-Type': 'application/json' },
+        body: JSON.stringify(clientBody),
+      })
+      return { out: await res.text(), calls }
+    } finally {
+      globalThis.fetch = realFetch3
+      if (proxy) { try { await Promise.race([proxy.close(), new Promise((r) => setTimeout(r, 1500))]) } catch {} }
+    }
+  }
+
+  const originalMessages = [{ role: 'user', content: '读一下 qoder.mjs' }]
+  const clientBody = { model: 'spark-x2.6', stream: true, messages: originalMessages }
+
+  const leakText =
+    '<ops_bash<arg_key>command</arg_key><arg_value>cat qoder.mjs</arg_value>' +
+    '<arg_key>description</arg_key><arg_value>Read full qoder rule pack</arg_value></tool_call>'
+  const draftFrames = [
+    delta({ content: leakText }),
+    finish('stop'),
+    '[DONE]',
+  ]
+  const cleanFrames = [
+    delta({ content: '好的，这是 qoder.mjs 的内容。' }),
+    finish('stop'),
+    '[DONE]',
+  ]
+  const toolCallFrame = JSON.stringify({
+    choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'ops_bash', arguments: '{"command":"cat qoder.mjs"}' } }] }, finish_reason: 'tool_calls' }],
+  })
+  const toolFrames = [toolCallFrame, '[DONE]']
+
+  // —— 单元：三钩子存在且只在 loomy 定义（绝不进 DEFAULTS）——
+  check('[伪工具草稿] loomy.isIncompleteTurn 是函数', typeof loomyRules.isIncompleteTurn === 'function')
+  check('[伪工具草稿] loomy.incompleteTurnMessages 是函数', typeof loomyRules.incompleteTurnMessages === 'function')
+  check('[伪工具草稿] loomy.maxIncompleteTurnRetries 是函数', typeof loomyRules.maxIncompleteTurnRetries === 'function')
+  const { normalizePack } = await import('../lib/registry.mjs')
+  const defaults = normalizePack({ name: '__probe_defaults__' })
+  check('[伪工具草稿] 默认包不含 isIncompleteTurn（否则续推链 find 会错位）', !('isIncompleteTurn' in defaults))
+  check('[伪工具草稿] 默认包不含 incompleteTurnMessages（否则破坏 qoder 续推）', !('incompleteTurnMessages' in defaults))
+  equal('[伪工具草稿] 有界重试次数=1', loomyRules.maxIncompleteTurnRetries(), 1)
+
+  // —— 单元：检测命中/不命中边界 ——
+  const meta = (over) => ({ sawContent: true, sawToolCall: false, sawFinishReason: true, sentAnything: true, contentText: leakText, ...over })
+  check('[伪工具草稿] 真实泄漏文本命中', loomyRules.isIncompleteTurn('spark-x2.6', meta()) === true)
+  check('[伪工具草稿] 正常回答不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: '好的，结果如下。' })) === false)
+  check('[伪工具草稿] 单个 <arg_key> 技术说明不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: '正文里提到 <arg_key> 字段是正常的。' })) === false)
+  check('[伪工具草稿] 代码围栏里的示例不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: '示例：```\n' + leakText + '\n```\n以上是演示。' })) === false)
+  check('[伪工具草稿] 有结构化 tool_calls 不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ sawToolCall: true })) === false)
+  check('[伪工具草稿] 无 finish_reason（断流）不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ sawFinishReason: false })) === false)
+  check('[伪工具草稿] 无正文不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ sawContent: false, contentText: '' })) === false)
+  check('[伪工具草稿] meta 为空不命中', loomyRules.isIncompleteTurn('spark-x2.6', {}) === false)
+
+  // —— 单元：纠正消息结构 ——
+  const fixed = loomyRules.incompleteTurnMessages(originalMessages, leakText)
+  equal('[伪工具草稿] 纠正消息长度', fixed.length, originalMessages.length + 2)
+  equal('[伪工具草稿] 追加 assistant 回合', fixed[1].role, 'assistant')
+  check('[伪工具草稿] assistant 回合原样保留草稿', fixed[1].content === leakText)
+  equal('[伪工具草稿] 追加 user 纠正回合', fixed[2].role, 'user')
+  check('[伪工具草稿] 纠正指令点名 tool_calls', fixed[2].content.includes('tool_calls'))
+  check('[伪工具草稿] 原 messages 未被改', originalMessages.length === 1)
+
+  // —— E2E：草稿流必须触发续推（第二次请求），纠正消息进请求体 ——
+  try {
+    const r = await runDraftStream([draftFrames, cleanFrames], clientBody)
+    equal('E2E[伪工具草稿] 触发且仅触发 1 次续推（共 2 次请求）', r.calls.length, 2)
+    const retry = r.calls[1]
+    equal('E2E[伪工具草稿] 续推请求 messages 长度', retry.messages.length, originalMessages.length + 2)
+    equal('E2E[伪工具草稿] 续推 assistant 回合', retry.messages[1].role, 'assistant')
+    check('E2E[伪工具草稿] 续推 assistant 保留草稿正文', retry.messages[1].content === leakText)
+    check('E2E[伪工具草稿] 续推 user 纠正指令进请求体', retry.messages[2].content.includes('tool_calls'))
+    check('E2E[伪工具草稿] 最终输出含纠正后的正常正文', r.out.includes('好的，这是 qoder.mjs 的内容。'))
+  } catch (error) {
+    check('E2E[伪工具草稿] 无异常', false, String((error && error.stack) || error))
+  }
+
+  // —— E2E：正常回答流不触发续推（负向，避免误伤）——
+  try {
+    const r = await runDraftStream([cleanFrames, cleanFrames], clientBody)
+    equal('E2E[伪工具草稿] 正常回答不续推（仅 1 次请求）', r.calls.length, 1)
+    check('E2E[伪工具草稿] 正常回答正文保留', r.out.includes('好的，这是 qoder.mjs 的内容。'))
+  } catch (error) {
+    check('E2E[伪工具草稿] 正常回答无异常', false, String((error && error.stack) || error))
+  }
+
+  // —— E2E：已有结构化 tool_calls 的流不触发续推 ——
+  try {
+    const r = await runDraftStream([toolFrames, cleanFrames], clientBody)
+    equal('E2E[伪工具草稿] 结构化 tool_calls 不续推（仅 1 次请求）', r.calls.length, 1)
+  } catch (error) {
+    check('E2E[伪工具草稿] tool_calls 流无异常', false, String((error && error.stack) || error))
+  }
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed')
 process.exit(failures === 0 ? 0 : 1)

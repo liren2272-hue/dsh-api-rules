@@ -352,6 +352,34 @@ test('admin panel entry follows the payload, not a hard-coded route list', async
   assert.equal(anchors[0].props.href, extra.adminUrl, 'link carries the new route adminUrl')
 })
 
+test('监听挂掉时卡片必须报警（2026-11-08 事故：卡片全绿但六条 API 全断）', async (t) => {
+  const base = JSON.parse(readFileSync(FIXTURE_FILE, 'utf8'))
+  // 服务端回传 proxy.listening=false 时，卡片必须出现告警文案。
+  const payload = { ...base, proxy: { listening: false, port: 8788, error: 'EADDRINUSE' } }
+  const h = await mount(payload)
+  t.after(() => {
+    try { h.cleanup && h.cleanup() } catch { /* ignore */ }
+    h.restore()
+  })
+  const zh = h.dicts[NS].zh
+  const alerts = byClass(h.tree, 'arc-alert')
+  assert.equal(alerts.length, 1, 'must render exactly one alert banner')
+  const text = visibleText(h.tree).join(' ')
+  assert.ok(text.includes('8788'), 'alert must name the port, got: ' + text.slice(0, 200))
+  assert.ok(text.includes('EADDRINUSE'), 'alert must surface the listen error')
+  assert.ok(text.includes(zh['alert.proxyDown'].split('（')[0]), 'alert must use the localized copy')
+})
+
+test('旧宿主不返回 proxy 键时不误报', async (t) => {
+  const payload = JSON.parse(readFileSync(FIXTURE_FILE, 'utf8'))
+  const h = await mount(payload)
+  t.after(() => {
+    try { h.cleanup && h.cleanup() } catch { /* ignore */ }
+    h.restore()
+  })
+  assert.equal(byClass(h.tree, 'arc-alert').length, 0, 'no alert when the payload omits proxy state')
+})
+
 test('card copy is read through t(key, vars), never t.property', () => {
   const code = readFileSync(CLIENT_FILE, 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '') // block comments / jsdoc

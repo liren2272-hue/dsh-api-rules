@@ -1,0 +1,431 @@
+package pool
+
+import (
+	"context"
+	"errors"
+	"math"
+	"math/rand"
+	"sort"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"minimax2api/internal/config"
+	"minimax2api/internal/minimax"
+	"minimax2api/internal/store"
+)
+
+var (
+	// ErrNoAccount means the pool is empty.
+	ErrNoAccount = errors.New("no account available")
+	// ErrNoCapacity means every account is saturated or cooling down.
+	ErrNoCapacity = errors.New("all accounts are busy")
+	// ErrNoEligible means the pool has accounts but none matches the filter a
+	// request brought. Waiting cannot change that, so it is returned at once.
+	ErrNoEligible = errors.New("no account matches the request requirements")
+)
+
+type stickyEntry struct {
+	accountID string
+	expires   time.Time
+}
+
+// maxStickyEntries bounds how large the sticky map may grow before expired
+// entries are swept. Session keys are caller-supplied and effectively
+// unbounded, so without this the map leaks one entry per unique key.
+const maxStickyEntries = 1024
+
+// Pool owns account selection, in-flight accounting and cooldown state.
+type Pool struct {
+	mu       sync.Mutex
+	store    *store.Store
+	settings func() config.Settings
+	inflight map[string]int
+	sticky   map[string]stickyEntry
+	cursor   int
+}
+
+func New(st *store.Store, settings func() config.Settings) *Pool {
+	return &Pool{
+		store:    st,
+		settings: settings,
+		inflight: make(map[string]int),
+		sticky:   make(map[string]stickyEntry),
+	}
+}
+
+// Lease is one borrowed account. Release must be called exactly once.
+type Lease struct {
+	Account *store.Account
+	pool    *Pool
+	once    sync.Once
+}
+
+// Release returns the account to the pool and applies health bookkeeping.
+func (l *Lease) Release(err error) {
+	l.once.Do(func() {
+		l.pool.release(l.Account.ID, err)
+	})
+}
+
+// Inflight reports the current in-flight count for an account.
+func (p *Pool) Inflight(id string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inflight[id]
+}
+
+// Snapshot returns a copy of the in-flight counters.
+func (p *Pool) Snapshot() map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]int, len(p.inflight))
+	for key, value := range p.inflight {
+		out[key] = value
+	}
+	return out
+}
+
+// AcquireOptions narrows which account one request may ride on.
+type AcquireOptions struct {
+	SessionKey string
+	// Eligible, when set, must accept an account before it can be picked.
+	Eligible func(*store.Account) bool
+	// IgnoreCreditGuard skips the zero-balance hold. It exists for models the
+	// upstream bills against a plan quota instead of the credit balance, where
+	// a zero balance says nothing about whether the call is affordable.
+	IgnoreCreditGuard bool
+}
+
+// Acquire borrows an account, waiting up to the configured capacity timeout.
+func (p *Pool) Acquire(ctx context.Context, sessionKey string) (*Lease, error) {
+	return p.AcquireWith(ctx, AcquireOptions{SessionKey: sessionKey})
+}
+
+// AcquireWith is Acquire with a request-specific filter. ErrNoEligible is
+// returned immediately rather than after the capacity wait: a later release
+// cannot make an account that fails the filter match it.
+func (p *Pool) AcquireWith(ctx context.Context, opts AcquireOptions) (*Lease, error) {
+	settings := p.settings()
+	deadline := time.Now().Add(settings.CapacityWait())
+
+	for {
+		account, wait := p.pick(opts)
+		if account != nil {
+			return &Lease{Account: account, pool: p}, nil
+		}
+		// ErrNoEligible and ErrNoAccount cannot be cured by waiting: the first
+		// because no release can make an account pass the filter, the second
+		// because there is nothing in the pool at all. Waiting out the full
+		// capacity timeout would only hold the caller hostage.
+		if errors.Is(wait, ErrNoEligible) || errors.Is(wait, ErrNoAccount) || time.Now().After(deadline) {
+			return nil, wait
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// pick selects a routable account and reserves an in-flight slot.
+func (p *Pool) pick(opts AcquireOptions) (*store.Account, error) {
+	// Read the store and settings before taking p.mu. Keeping every cross
+	// component call outside the critical section means p.mu can never take
+	// part in a lock-order cycle with store.mu.
+	accounts := p.store.ListAccounts()
+	if len(accounts) == 0 {
+		return nil, ErrNoAccount
+	}
+	settings := p.settings()
+	sessionKey := opts.SessionKey
+	eligible := opts.Eligible
+	if eligible != nil {
+		matched := false
+		for _, account := range accounts {
+			if eligible(account) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, ErrNoEligible
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+
+	// The sticky map is keyed by caller-supplied session keys, so it grows with
+	// the key space and nothing evicts keys that never come back. Once it is
+	// clearly past a sane working set, drop every expired entry in one pass.
+	if len(p.sticky) > maxStickyEntries {
+		for key, entry := range p.sticky {
+			if now.After(entry.expires) {
+				delete(p.sticky, key)
+			}
+		}
+	}
+
+	// Sticky sessions reuse their previous account while it stays routable.
+	// hadSticky stays true when the bound account merely has no free slot right
+	// now: a saturation blip then reroutes the request without rewriting the
+	// binding, so the session returns to its account once a slot frees up. Only
+	// a binding whose account is gone is treated as stale and re-bound below.
+	hadSticky := false
+	if sessionKey != "" && settings.StickyTTL() > 0 {
+		if entry, ok := p.sticky[sessionKey]; ok {
+			if now.After(entry.expires) {
+				delete(p.sticky, sessionKey)
+			} else {
+				bound := false
+				for _, account := range accounts {
+					if account.ID == entry.accountID {
+						bound = true
+					}
+					if account.ID != entry.accountID || (eligible != nil && !eligible(account)) {
+						continue
+					}
+					if routable(account, p.inflight[account.ID], now, settings, opts.IgnoreCreditGuard) {
+						p.inflight[account.ID]++
+						entry.expires = now.Add(settings.StickyTTL())
+						p.sticky[sessionKey] = entry
+						return account, nil
+					}
+				}
+				hadSticky = bound
+			}
+		}
+	}
+
+	candidates := make([]*store.Account, 0, len(accounts))
+	for _, account := range accounts {
+		if eligible != nil && !eligible(account) {
+			continue
+		}
+		if routable(account, p.inflight[account.ID], now, settings, opts.IgnoreCreditGuard) {
+			candidates = append(candidates, account)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, ErrNoCapacity
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if settings.Routing.PreferIdle && p.inflight[left.ID] != p.inflight[right.ID] {
+			return p.inflight[left.ID] < p.inflight[right.ID]
+		}
+		if left.Priority != right.Priority {
+			return left.Priority < right.Priority
+		}
+		return left.CreatedAt.Before(right.CreatedAt)
+	})
+
+	var chosen *store.Account
+	switch settings.Routing.Strategy {
+	case "round_robin":
+		p.cursor = (p.cursor + 1) % len(candidates)
+		chosen = candidates[p.cursor]
+	case "random":
+		chosen = candidates[rand.Intn(len(candidates))]
+	case "priority":
+		chosen = candidates[0]
+	default: // least_inflight
+		chosen = candidates[0]
+		for _, candidate := range candidates[1:] {
+			if p.inflight[candidate.ID] < p.inflight[chosen.ID] {
+				chosen = candidate
+			}
+		}
+	}
+
+	p.inflight[chosen.ID]++
+	if !hadSticky && sessionKey != "" && settings.StickyTTL() > 0 {
+		p.sticky[sessionKey] = stickyEntry{accountID: chosen.ID, expires: now.Add(settings.StickyTTL())}
+	}
+	return chosen, nil
+}
+
+func routable(account *store.Account, inflight int, now time.Time, settings config.Settings, ignoreCreditGuard bool) bool {
+	if !account.Enabled {
+		return false
+	}
+	switch account.Status {
+	case store.StatusDisabled, store.StatusInvalid:
+		return false
+	}
+	if account.Status == store.StatusCooldown && now.Before(account.CooldownUntil) {
+		return false
+	}
+	// A token without a fingerprint cannot be replayed: the yy signature is
+	// computed over the fingerprint query string, so an account missing either
+	// half is unusable rather than merely degraded.
+	if account.Token == "" || account.UUID == "" || account.DeviceID == "" {
+		return false
+	}
+	// An account that has not been prepared is worse than unusable, because of
+	// how it fails.
+	//
+	// Without the realUserID every signed call answers a bare 401 — the same 401
+	// a dead token produces — and this pool retires an account that reports one.
+	// So routing an unprepared account would delete a healthy account from the
+	// pool. Without the agent id the session handshake answers 200 and opens
+	// nothing, which burns a request to learn nothing.
+	//
+	// Both are filled in when the account is added or probed; an account that
+	// still lacks them is held out of rotation rather than handed a request that
+	// can only produce a false verdict.
+	if account.UserID == "" || account.UserID == "0" || account.AgentID == "" {
+		return false
+	}
+	// A spent account is held out of rotation, but only while the reading is
+	// recent. Past CreditFresh the balance counts as unknown and the account is
+	// scheduled again: a day-old zero would otherwise strand capacity that a
+	// single request refills, and the upstream remains the final authority on
+	// whether a request is affordable.
+	if !ignoreCreditGuard && settings.Signin.SkipZeroCredit && account.Credit.Exhausted() &&
+		now.Sub(account.Credit.SyncedAt) < settings.CreditFresh() {
+		return false
+	}
+	limit := account.MaxConcurrent
+	if limit <= 0 {
+		limit = 1
+	}
+	return inflight < limit
+}
+
+// release applies health bookkeeping and clears the in-flight slot.
+func (p *Pool) release(id string, err error) {
+	p.mu.Lock()
+	if p.inflight[id] > 0 {
+		p.inflight[id]--
+	}
+	p.mu.Unlock()
+
+	settings := p.settings()
+	p.store.SaveAccountState(id, func(account *store.Account) {
+		account.LastUsedAt = time.Now()
+		if err == nil {
+			account.SuccessCount++
+			account.FailCount = 0
+			if account.Status == store.StatusCooldown {
+				account.Status = store.StatusActive
+				account.CooldownUntil = time.Time{}
+			}
+			if account.Status == store.StatusActive {
+				account.LastError = ""
+			}
+			return
+		}
+
+		// A request the upstream refused is not evidence about this account —
+		// the next account answers the same way. Charging it here is how one
+		// caller's bad payload walks the pool into cooldown, so the account is
+		// returned to service untouched rather than blamed.
+		if errors.Is(err, minimax.ErrUpstreamRejected) || errors.Is(err, minimax.ErrEmptyResponse) {
+			return
+		}
+
+		// A caller that walked away — the user hit stop, the browser tab closed,
+		// an intermediate proxy cut the stream — says just as little about the
+		// account. Cancellation is the one error class that is always the
+		// caller's own doing, so it is returned to service untouched. Deadlines
+		// are deliberately NOT exempted: request contexts carry no deadline, so
+		// one can only come from this gateway's own upstream timeout, which is
+		// real evidence that the account was too slow to answer.
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+
+		account.FailCount++
+		account.LastError = truncate(err.Error(), 240)
+
+		if errors.Is(err, minimax.ErrInvalidCredential) {
+			account.Status = store.StatusInvalid
+			account.CooldownUntil = time.Time{}
+			return
+		}
+
+		base := settings.CooldownBase()
+		maxCooldown := settings.CooldownMax()
+		backoff := time.Duration(float64(base) * math.Pow(2, float64(min(account.FailCount-1, 6))))
+		if backoff > maxCooldown {
+			backoff = maxCooldown
+		}
+		account.Status = store.StatusCooldown
+		account.CooldownUntil = time.Now().Add(backoff)
+	})
+}
+
+// ClearCooldown resets a cooling account so it can be scheduled again.
+func (p *Pool) ClearCooldown(id string) {
+	p.store.SaveAccountState(id, func(account *store.Account) {
+		account.Status = store.StatusActive
+		account.CooldownUntil = time.Time{}
+		account.FailCount = 0
+		account.LastError = ""
+	})
+}
+
+// DropSticky forgets the sticky binding for a session.
+func (p *Pool) DropSticky(sessionKey string) {
+	if sessionKey == "" {
+		return
+	}
+	p.mu.Lock()
+	delete(p.sticky, sessionKey)
+	p.mu.Unlock()
+}
+
+// Summary reports pool health for dashboards and /health.
+func (p *Pool) Summary() (total, active, cooldown, disabled, invalid, routableCount int) {
+	accounts := p.store.ListAccounts()
+	settings := p.settings()
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, account := range accounts {
+		total++
+		// Enabled is checked first because the two mutation paths disagree:
+		// UpdateAccount mirrors Enabled into Status, while SaveAccountState does
+		// not. An account switched off through the latter would otherwise still
+		// be reported as active on the dashboard.
+		switch {
+		case !account.Enabled, account.Status == store.StatusDisabled:
+			disabled++
+		case account.Status == store.StatusInvalid:
+			invalid++
+		case account.Status == store.StatusCooldown && now.Before(account.CooldownUntil):
+			// Only a cooldown that is still running counts as cooling. Status is
+			// a snapshot written when the failure happened, so it keeps saying
+			// cooldown long after the window elapsed; counting it here would
+			// report a pool of 0 active accounts while every one of them is in
+			// fact schedulable again.
+			cooldown++
+		default:
+			active++
+		}
+		if routable(account, p.inflight[account.ID], now, settings, false) {
+			routableCount++
+		}
+	}
+	return
+}
+
+func truncate(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	// Cut on a rune boundary. Slicing at a fixed byte offset can split a
+	// multi-byte character, which would push invalid UTF-8 into lastError and
+	// from there into the audit log and the console.
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "…"
+}

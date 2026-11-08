@@ -1,0 +1,2108 @@
+package gateway
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"minimax2api/internal/config"
+	"minimax2api/internal/minimax"
+	"minimax2api/internal/pool"
+	"minimax2api/internal/store"
+)
+
+// Version is reported by /health.
+const Version = "0.3.0"
+
+// Gateway exposes the OpenAI-compatible surface.
+type Gateway struct {
+	store    *store.Store
+	pool     *pool.Pool
+	client   *minimax.Client
+	settings func() config.Settings
+	limiter  *limiter
+	// files is the local registry behind /v1/files, built on first use from
+	// the media settings. See files.go.
+	files     *fileStore
+	filesOnce sync.Once
+}
+
+func New(st *store.Store, p *pool.Pool, client *minimax.Client, settings func() config.Settings) *Gateway {
+	return &Gateway{
+		store:    st,
+		pool:     p,
+		client:   client,
+		settings: settings,
+		limiter:  newLimiter(),
+	}
+}
+
+// respWriter records whether the response has already been committed.
+type respWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *respWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *respWriter) Write(data []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *respWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// ------------------------------------------------------------- chat handler
+
+type chatRequest struct {
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+	Stream   bool          `json:"stream"`
+	User     string        `json:"user"`
+	Tools    []toolSpec    `json:"tools"`
+	// Thinking turns the reasoning variant on or off. It is a request field
+	// rather than a catalogue entry because that is what it is upstream: a
+	// `variant` value on the model object, not a different model. Nil means the
+	// caller said nothing and the upstream default applies.
+	Thinking *bool `json:"thinking"`
+	// ContextWindow asks for a context size in tokens. It is repaired to the
+	// nearest size the model offers rather than rejected; zero means "no
+	// preference" and sends nothing.
+	ContextWindow int `json:"context_window"`
+	// StreamOptions mirrors OpenAI's field of the same name; only include_usage
+	// has an effect. Without it a stream never reports usage, which left every
+	// streaming client without the token counts the non-streaming response has.
+	StreamOptions *streamOptions `json:"stream_options"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// streamUsage renders the usage chunk for a stream that asked for it. A nil
+// return means the caller said nothing and no usage chunk goes out.
+func streamUsage(request chatRequest, promptTokens, completionTokens int) map[string]any {
+	if request.StreamOptions == nil || !request.StreamOptions.IncludeUsage {
+		return nil
+	}
+	return map[string]any{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + completionTokens,
+	}
+}
+
+type chatMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+	// ToolCalls rides on assistant messages and ToolCallID on tool messages.
+	// The gateway emulates tools over prose, so a follow-up turn only makes
+	// sense to the model if the calls it made and the results it got are
+	// flattened back into the prompt it reads. Without these fields the second
+	// turn of any tool loop reaches the model as "assistant said nothing" plus
+	// "user said: <result>" — see buildPrompt.
+	ToolCalls  []toolCallRef `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+}
+
+// toolCallRef is the one entry of an OpenAI `tool_calls` array, as a client
+// echoes it back in the conversation history.
+type toolCallRef struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type contentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	ImageURL struct {
+		URL string `json:"url"`
+	} `json:"image_url"`
+	File struct {
+		FileID   string `json:"file_id"`
+		Filename string `json:"filename"`
+		FileData string `json:"file_data"`
+	} `json:"file"`
+}
+
+// ChatCompletions implements POST /v1/chat/completions.
+func (g *Gateway) ChatCompletions(w http.ResponseWriter, r *http.Request) {
+	out := &respWriter{ResponseWriter: w}
+	started := time.Now()
+
+	key, err := g.authenticate(r)
+	if err != nil {
+		writeError(out, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if err := g.limiter.acquire(key); err != nil {
+		writeError(out, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	defer g.limiter.release(key)
+
+	// 64MB: inline `file_data` attachments are base64 inside the JSON body, so
+	// a ~40MB document costs ~54MB encoded. Bigger files belong in /v1/files.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	if err != nil {
+		writeError(out, http.StatusBadRequest, "cannot read request body")
+		return
+	}
+
+	var request chatRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		writeError(out, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	modelID := request.Model
+	if modelID == "" {
+		modelID = "minimax-agent"
+	}
+	model, ok := g.store.ModelByID(modelID)
+	if !ok || !model.Enabled {
+		writeError(out, http.StatusBadRequest, fmt.Sprintf("unknown or disabled model %q", modelID))
+		return
+	}
+	// Every catalogue type is reachable here, and that is the point of the
+	// catalogue rather than an accident. `/v1/models` cannot say what a model
+	// *is* — the schema is id/object/created/owned_by and nothing else — so a
+	// chat client fills its model picker with every id it finds and sends the
+	// user's message to this endpoint whichever one was picked. A model that is
+	// listed here and then refused here is therefore a trap, not a boundary:
+	// the caller sees a 400 and has no way to tell it apart from a broken
+	// gateway. Video entries were already accepted (they are rewritten into a
+	// plugin reference); image entries are dispatched to the image turn below.
+	// Only a type this build does not know is rejected.
+	switch model.Type {
+	case store.ModelTypeChat, store.ModelTypeVideo, store.ModelTypeImage:
+	default:
+		writeError(out, http.StatusBadRequest, fmt.Sprintf("model %q is not a chat model", modelID))
+		return
+	}
+
+	// The same cap the video endpoint enforces, applied where the pictures
+	// arrive as message content rather than as request fields. A chat turn has
+	// nowhere to report a trim — its answer is the agent's own prose — so this
+	// one happens silently; VideoGenerations reports the identical trim. The
+	// cap rides into buildPrompt so the pictures beyond it are never fetched
+	// at all, not downloaded and then dropped.
+	keep, _ := referenceLimit(model, countImageReferences(request.Messages))
+	prompt, images, files, err := g.buildPrompt(r.Context(), request.Messages, keep, key.ID)
+	if err != nil {
+		writeError(out, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The same cap the video endpoint enforces, applied where the pictures
+	// arrive as message content rather than as request fields. A chat turn has
+	// nowhere to report a trim — its answer is the agent's own prose — so this
+	// one happens silently; VideoGenerations reports the identical trim.
+	if prompt == "" && len(images) == 0 && len(files) == 0 {
+		writeError(out, http.StatusBadRequest, "messages must contain text, image or file content")
+		return
+	}
+
+	if model.Type == store.ModelTypeImage {
+		g.chatImage(out, r, key, model, request, prompt, images, body, started)
+		return
+	}
+
+	// Every catalogue entry reaches the same upstream agent, so the entry itself
+	// is not a routing decision — but it does name a model now. `thinking` and
+	// `context_window` are the two knobs the upstream's model object carries,
+	// and both are repaired here rather than rejected (see modelSelection).
+	variant, contextLimit := modelSelection(model, request.Thinking, request.ContextWindow)
+
+	settings := g.settings()
+	prompt = g.outgoingText(settings, model, prompt, minimax.VideoOptions{})
+
+	// Tool declarations ride along in the turn text, because the upstream body
+	// has no field that could carry them. tools.go records the evidence and the
+	// cost of the emulation; nothing here should be read as native support.
+	toolsEnabled := model.Type == store.ModelTypeChat && hasToolDeclarations(request.Tools)
+	if toolsEnabled {
+		prompt = injectTools(prompt, request.Tools)
+	}
+	if model.Type == store.ModelTypeChat {
+		prompt = isolateConversation(prompt)
+	}
+
+	splitter := newToolSplitter(toolsEnabled)
+
+	// Every chunk of one completion shares one id and one created stamp — that
+	// is the OpenAI stream contract, and clients that aggregate by id split a
+	// mixed-id stream into several completions.
+	var stream *sseStream
+	var onDelta, onThinking func(string)
+	if request.Stream {
+		stream = newSSEStream(out, model)
+		onDelta = func(text string) {
+			if safe := splitter.push(text); safe != "" {
+				stream.delta(map[string]any{"content": safe}, nil)
+			}
+		}
+		onThinking = func(text string) {
+			stream.delta(map[string]any{"reasoning_content": text}, nil)
+		}
+		// The role frame is deferred to the first real delta rather than written
+		// up front. Writing it eagerly committed the response before the first
+		// attempt reached the upstream, which made every streaming request
+		// unfailable: a dead account, a timeout or a 5xx could never be retried
+		// on another account, because the caller had already begun reading an
+		// answer. Nothing is on the wire until a delta exists, so the committed
+		// check below now means what it says.
+	}
+
+	turn, lastErr := g.runTurn(r.Context(), turnRequest{
+		Prompt:       prompt,
+		Images:       images,
+		Files:        files,
+		Model:        model,
+		Variant:      variant,
+		ContextLimit: contextLimit,
+		// The user field is caller-supplied, so the sticky key carries the
+		// client key with it: two keys that both claim user "1" must not end up
+		// pinned to the same account, where one could aim its expensive or
+		// failing requests at the other's binding.
+		SessionKey:   key.ID + ":" + request.User,
+		Started:      started,
+		OnDelta:      onDelta,
+		OnThinking:   onThinking,
+		Committed:    func() bool { return out.wroteHeader },
+		ResetStream:  splitter.reset,
+	})
+
+	accountName := turn.AccountName
+	promptTokens := estimateTokens(prompt)
+	if lastErr != nil {
+		g.recordAudit(r, key, model, accountName, started, upstreamStatus(lastErr), 0, promptTokens, 0, request.Stream, turn.Retries, string(body), "", lastErr.Error())
+		if out.wroteHeader {
+			writeSSEError(out, lastErr.Error())
+			return
+		}
+		writeError(out, upstreamStatus(lastErr), lastErr.Error())
+		return
+	}
+	result := turn.Result
+	if result == nil {
+		writeError(out, http.StatusBadGateway, "upstream returned no result")
+		return
+	}
+
+	// A call block is removed from the prose only when it parsed. A block that
+	// is present but unreadable stays where it is: deleting text the caller
+	// never got to see would be worse than showing it.
+	text, calls := result.Text, []toolCall(nil)
+	if toolsEnabled {
+		text, calls = splitToolCalls(result.Text)
+	}
+
+	completionTokens := estimateTokens(result.Text + result.Thinking)
+	g.store.RecordModelUsage(model.ID, 1, int64(promptTokens+completionTokens))
+	g.store.BumpClientKeyUsage(key.ID)
+
+	if request.Stream {
+		if turn.Streamed {
+			// The splitter owns the tail: every byte already emitted came out of
+			// it, so only it knows what is still being held back.
+			tail, held := splitter.finish()
+			if tail != "" {
+				stream.delta(map[string]any{"content": tail}, nil)
+			}
+			if held != nil {
+				calls = held
+			}
+		} else {
+			if result.Thinking != "" {
+				stream.delta(map[string]any{"reasoning_content": result.Thinking}, nil)
+			}
+			if text != "" {
+				stream.delta(map[string]any{"content": text}, nil)
+			}
+		}
+		mediaURLs := g.persistMediaList(result.Media, prompt, model.ID, accountName)
+		stream.finish(mediaURLs, calls, streamUsage(request, promptTokens, completionTokens))
+		g.recordAudit(r, key, model, accountName, started, http.StatusOK, turn.FirstToken, promptTokens, completionTokens, true, turn.Retries, string(body), result.Text, "")
+		return
+	}
+
+	message := map[string]any{
+		"role":              "assistant",
+		"content":           text,
+		"reasoning_content": result.Thinking,
+	}
+	finishReason := "stop"
+	if len(calls) > 0 {
+		message["tool_calls"] = toolCallsPayload(calls)
+		finishReason = "tool_calls"
+	}
+
+	response := map[string]any{
+		"id":      "chatcmpl-" + randomID(12),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model.ID,
+		"choices": []any{
+			map[string]any{
+				"index":         0,
+				"message":       message,
+				"finish_reason": finishReason,
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      promptTokens + completionTokens,
+		},
+	}
+	if len(result.Media) > 0 {
+		response["media"] = g.persistMediaList(result.Media, prompt, model.ID, accountName)
+	}
+
+	raw, _ := json.Marshal(response)
+	g.recordAudit(r, key, model, accountName, started, http.StatusOK, turn.FirstToken, promptTokens, completionTokens, false, turn.Retries, string(body), string(raw), "")
+	out.Header().Set("content-type", "application/json")
+	out.WriteHeader(http.StatusOK)
+	_, _ = out.Write(raw)
+}
+
+// turnRequest is one call to the upstream: what to send, which pool to draw
+// from, and how deltas leave.
+type turnRequest struct {
+	Prompt       string
+	Images       []minimax.UploadedImage
+	Files        []minimax.PendingAttachment
+	Model        *store.ModelConfig
+	Variant      *string
+	ContextLimit int
+	SessionKey   string
+	Started      time.Time
+	OnDelta      func(string)
+	OnThinking   func(string)
+	// Committed reports whether the response has already begun. A retry is only
+	// safe while nothing has been written: once the caller has seen a byte, a
+	// second account would append a second answer to the first.
+	Committed func() bool
+	// ResetStream drops per-attempt stream state before a retry. The tool
+	// splitter holds bytes between deltas — a half-seen tag, an open block —
+	// and a failed attempt must not leak those into the next answer.
+	ResetStream func()
+}
+
+// turnResult carries what the turn produced plus the bookkeeping an audit row
+// needs.
+type turnResult struct {
+	Result      *minimax.Result
+	AccountName string
+	FirstToken  int64
+	Retries     int
+	Streamed    bool
+}
+
+// errSubscriptionRequired reports that a plan-only model has no subscribed
+// account to ride on. It is a capacity condition, not an upstream failure, and
+// upstreamStatus maps it to 503.
+var errSubscriptionRequired = errors.New("subscription account required")
+
+// acquireAccount borrows an account for one turn. Plan-only models get a
+// filtered pool: the upstream charges a free account for the turn and only
+// then refuses it, so trying one costs more than waiting for a plan account.
+func (g *Gateway) acquireAccount(ctx context.Context, sessionKey string, model *store.ModelConfig) (*pool.Lease, error) {
+	if model == nil || !model.SubscriptionOnly {
+		return g.pool.Acquire(ctx, sessionKey)
+	}
+	lease, err := g.pool.AcquireWith(ctx, pool.AcquireOptions{
+		SessionKey: sessionKey,
+		Eligible: func(account *store.Account) bool {
+			return account.Subscribed()
+		},
+		// These models are billed against the plan, so a zero credit balance
+		// says nothing about whether the account can serve them.
+		IgnoreCreditGuard: true,
+	})
+	if errors.Is(err, pool.ErrNoEligible) {
+		return nil, fmt.Errorf("%w: %s needs a Token Plan account and the pool has none", errSubscriptionRequired, model.ID)
+	}
+	return lease, err
+}
+
+// runTurn leases an account, calls the upstream, and retries across accounts
+// while nothing has been committed to the client.
+//
+// Every endpoint shares this one path. It is a single function rather than two
+// so that failover, cooldown accounting and token estimation cannot drift apart
+// between the OpenAI and Anthropic front ends.
+func (g *Gateway) runTurn(ctx context.Context, req turnRequest) (*turnResult, error) {
+	settings := g.settings()
+	out := &turnResult{}
+
+	var (
+		mu         sync.Mutex
+		firstToken int64
+		streamed   bool
+	)
+
+	markFirst := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstToken == 0 {
+			firstToken = time.Since(req.Started).Milliseconds()
+		}
+		streamed = true
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		if attempt > 0 && req.ResetStream != nil {
+			req.ResetStream()
+		}
+		lease, err := g.acquireAccount(ctx, req.SessionKey, req.Model)
+		if err != nil {
+			return out, err
+		}
+		out.AccountName = displayName(lease.Account)
+		if attempt > 0 {
+			out.Retries = attempt
+		}
+
+		opts := minimax.Options{
+			Credential:   CredentialOf(lease.Account),
+			Text:         req.Prompt,
+			Model:        req.Model.UpstreamModel,
+			Variant:      req.Variant,
+			ContextLimit: req.ContextLimit,
+			Images:       req.Images,
+			Files:        req.Files,
+			Timeout:      timeoutFor(settings, req.Model),
+			IdleTimeout:  settings.StreamIdleTimeout(),
+		}
+		// A video model reached through the chat endpoint carries the same
+		// intent marker the dedicated video endpoint sends, so the upstream
+		// sees one fingerprint for one capability however it was reached.
+		if req.Model.Type == store.ModelTypeVideo {
+			opts.ClientIntent = minimax.VideoClientIntent
+		}
+		if req.OnDelta != nil {
+			opts.OnDelta = func(text string) {
+				markFirst()
+				req.OnDelta(text)
+			}
+		}
+		if req.OnThinking != nil {
+			opts.OnThinking = func(text string) {
+				markFirst()
+				req.OnThinking(text)
+			}
+		}
+
+		result, err := g.client.Completion(ctx, opts)
+		lease.Release(err)
+
+		lastErr = err
+		if err == nil {
+			mu.Lock()
+			out.FirstToken, out.Streamed = firstToken, streamed
+			mu.Unlock()
+			if out.FirstToken == 0 {
+				out.FirstToken = time.Since(req.Started).Milliseconds()
+			}
+			out.Result = result
+			return out, nil
+		}
+		// A refusal is final for this request: the same call on the next account
+		// draws the same answer, and every attempt spends an account to learn
+		// nothing. See minimax.ErrUpstreamRejected.
+		if ctx.Err() != nil || isPoolExhausted(err) || errors.Is(err, minimax.ErrUpstreamRejected) {
+			break
+		}
+		if req.Committed != nil && req.Committed() {
+			break
+		}
+	}
+
+	mu.Lock()
+	out.FirstToken, out.Streamed = firstToken, streamed
+	mu.Unlock()
+	return out, lastErr
+}
+
+// ensureStreamHeaders writes the SSE preamble exactly once, so every caller
+// that emits a chunk gets the same headers no matter who writes first.
+func ensureStreamHeaders(out *respWriter) {
+	if out.wroteHeader {
+		return
+	}
+	out.Header().Set("content-type", "text/event-stream")
+	out.Header().Set("cache-control", "no-cache")
+	out.Header().Set("connection", "keep-alive")
+	out.Header().Set("x-accel-buffering", "no")
+	out.WriteHeader(http.StatusOK)
+}
+
+// sseStream owns one OpenAI-compatible streaming response: the id and created
+// stamp every chunk of a completion must share, the deferred role frame, and
+// the terminal frames.
+//
+// The role frame is emitted lazily — ahead of the first chunk that actually
+// needs to go out — so a request whose first attempt fails before producing a
+// delta has nothing on the wire yet and can still fail over to another account.
+type sseStream struct {
+	out      *respWriter
+	model    *store.ModelConfig
+	id       string
+	created  int64
+	mu       sync.Mutex
+	roleSent bool
+}
+
+func newSSEStream(out *respWriter, model *store.ModelConfig) *sseStream {
+	return &sseStream{
+		out:     out,
+		model:   model,
+		id:      "chatcmpl-" + randomID(12),
+		created: time.Now().Unix(),
+	}
+}
+
+// delta writes one chunk, emitting the role frame ahead of the first one.
+func (s *sseStream) delta(delta map[string]any, finish any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureRoleLocked()
+	s.writeLocked(delta, finish)
+	s.out.Flush()
+}
+
+// finish terminates the stream: the role frame if nothing ever streamed, then
+// media URLs and any tool calls the model asked for, then the usage chunk the
+// request asked for (a nil usage emits none), then [DONE].
+func (s *sseStream) finish(mediaURLs []string, calls []toolCall, usage map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureRoleLocked()
+	if len(mediaURLs) > 0 {
+		s.writeLocked(map[string]any{"media": mediaURLs}, nil)
+	}
+	if len(calls) > 0 {
+		s.writeLocked(map[string]any{"tool_calls": streamedToolCallDeltas(calls)}, "tool_calls")
+	} else {
+		s.writeLocked(map[string]any{}, "stop")
+	}
+	if usage != nil {
+		s.usageChunkLocked(usage)
+	}
+	_, _ = io.WriteString(s.out, "data: [DONE]\n\n")
+	s.out.Flush()
+}
+
+func (s *sseStream) ensureRoleLocked() {
+	if s.roleSent {
+		return
+	}
+	s.roleSent = true
+	s.writeLocked(map[string]any{"role": "assistant", "content": ""}, nil)
+}
+
+func (s *sseStream) writeLocked(delta map[string]any, finish any) {
+	ensureStreamHeaders(s.out)
+	payload := map[string]any{
+		"id":      s.id,
+		"object":  "chat.completion.chunk",
+		"created": s.created,
+		"model":   s.model.ID,
+		"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
+	}
+	raw, _ := json.Marshal(payload)
+	_, _ = fmt.Fprintf(s.out, "data: %s\n\n", raw)
+}
+
+// usageChunkLocked renders the terminal usage chunk: an empty choices array
+// carrying the token counts, per OpenAI's include_usage shape.
+func (s *sseStream) usageChunkLocked(usage map[string]any) {
+	ensureStreamHeaders(s.out)
+	payload := map[string]any{
+		"id":      s.id,
+		"object":  "chat.completion.chunk",
+		"created": s.created,
+		"model":   s.model.ID,
+		"choices": []any{},
+		"usage":   usage,
+	}
+	raw, _ := json.Marshal(payload)
+	_, _ = fmt.Fprintf(s.out, "data: %s\n\n", raw)
+}
+
+// streamedToolCallDeltas renders calls in the incremental shape OpenAI streams.
+// The arguments arrive whole rather than token by token; a client concatenates
+// deltas, so one complete delta is a valid sequence of one.
+func streamedToolCallDeltas(calls []toolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(calls))
+	for index, call := range calls {
+		out = append(out, map[string]any{
+			"index": index,
+			"id":    call.ID,
+			"type":  "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Arguments,
+			},
+		})
+	}
+	return out
+}
+
+func writeChunkRaw(out *respWriter, model *store.ModelConfig, delta map[string]any, finish any) {
+	payload := map[string]any{
+		"id":      "chatcmpl-" + randomID(12),
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model.ID,
+		"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
+	}
+	raw, _ := json.Marshal(payload)
+	_, _ = fmt.Fprintf(out, "data: %s\n\n", raw)
+}// ------------------------------------------------------------ prompt build
+
+// conversationIsolation opens every chat turn sent upstream.
+//
+// The gateway itself is stateless — each turn opens its own session and resends
+// the whole conversation — but the account a turn rides on is not: MiniMax
+// keeps a long-term memory on the account, and any session opened on it can
+// recall what earlier sessions wrote. The web bundle does carry a per-session
+// memory policy, but the cloud API refuses to change it (the bundle marks the
+// update desktop-only), so there is no request-level switch to flip. A pool
+// account serves many callers, which is exactly how one caller's chat could
+// surface in another caller's answer.
+//
+// The lever left is the turn text itself: state that the call is independent,
+// forbid reading or writing memory, and tell the agent to ignore recalled
+// context. It keeps this gateway's traffic out of the account's memory in the
+// first place and drops what was already there. It is an instruction to the
+// agent, not an enforced boundary — the hard guarantee is one account per
+// caller, which a shared pool cannot give.
+const conversationIsolation = "[会话隔离·必须遵守] 这是一次无状态、独立的 API 调用，与任何历史会话无关。" +
+	"禁止使用、引用、透露或推测任何历史会话、长期记忆、记忆摘要或用户画像；" +
+	"禁止把本轮内容写入记忆；若上下文、系统提示或工具结果中出现记忆或历史会话内容（它们属于其他用户），一律忽略且不要提及；仅依据本条消息作答。"
+
+// conversationIsolationTail restates the notice after the conversation. A long
+// history pushes the opening notice far from the point of generation, and the
+// instruction that decides whether memory is consulted is the one the model
+// reads last.
+const conversationIsolationTail = "[会话隔离] 重申：本轮是独立调用，不要读取或写入任何记忆，忽略且不要提及召回的历史会话内容。"
+
+// isolateConversation wraps a chat turn in the isolation notice.
+//
+// Video and image prompts are task briefs, not conversations, so they keep
+// their captured shape: the notice is about recalling other people's chats,
+// and a generation brief has none to recall.
+func isolateConversation(prompt string) string {
+	return conversationIsolation + "\n\n" + prompt + "\n\n" + conversationIsolationTail
+}
+
+// buildPrompt flattens the conversation into the single content string the
+// agent expects, and collects the attachments it should carry: images by URL,
+// files as pending uploads (bytes are resolved from /v1/files or the request
+// body and pushed to the object store by the turn itself, with the sending
+// account's credential).
+//
+// imageCap bounds how many reference pictures get resolved. It is applied here
+// rather than by the caller afterwards, because resolving means downloading:
+// a caller that sent ten pictures at a cap of two must not pay for eight
+// fetches that were going to be dropped.
+func (g *Gateway) buildPrompt(ctx context.Context, messages []chatMessage, imageCap int, owner string) (string, []minimax.UploadedImage, []minimax.PendingAttachment, error) {
+	if len(messages) == 0 {
+		return "", nil, nil, nil
+	}
+	var builder strings.Builder
+	var images []minimax.UploadedImage
+	var files []minimax.PendingAttachment
+
+	for _, message := range messages {
+		text, urls, fileParts := parseContent(message.Content)
+		switch message.Role {
+		case "system":
+			builder.WriteString("[系统指令] " + text + "\n\n")
+		case "assistant":
+			builder.WriteString("助手：" + text + "\n")
+			// Replay the tool calls the assistant made, in the same shape the
+			// Anthropic front end uses. A parallel burst of calls is
+			// indistinguishable to the model otherwise: every result would read
+			// as prose from the user, with nothing tying it to its arguments.
+			for _, call := range message.ToolCalls {
+				builder.WriteString(fmt.Sprintf("[调用了工具 %s，参数 %s]\n", call.Function.Name, call.Function.Arguments))
+			}
+		case "tool":
+			// The result of a call the assistant made, labelled with the id the
+			// caller kept from the tool_calls payload.
+			builder.WriteString(fmt.Sprintf("[工具 %s 返回] %s\n", message.ToolCallID, text))
+		default:
+			if len(messages) > 1 {
+				builder.WriteString("用户：" + text + "\n")
+			} else {
+				builder.WriteString(text + "\n")
+			}
+		}
+
+		for _, raw := range urls {
+			if imageCap >= 0 && len(images) >= imageCap {
+				break
+			}
+			image, err := g.resolveImage(ctx, raw)
+			if err != nil {
+				return "", nil, nil, err
+			}
+			images = append(images, image)
+		}
+		for _, part := range fileParts {
+			file, err := g.resolveFilePart(part, owner)
+			if err != nil {
+				return "", nil, nil, err
+			}
+			files = append(files, file)
+		}
+	}
+
+	return strings.TrimSpace(builder.String()), images, files, nil
+}
+
+// countImageReferences reports how many reference pictures a conversation
+// carries, so the cap can be computed before anything is downloaded.
+func countImageReferences(messages []chatMessage) int {
+	total := 0
+	for _, message := range messages {
+		_, urls, _ := parseContent(message.Content)
+		total += len(urls)
+	}
+	return total
+}
+
+// resolveImage turns an OpenAI image reference into something the agent can
+// fetch on its own.
+//
+// It used to hand back a URL, either the caller's or one republished under
+// Media.PublicBaseURL, and the upstream resolved it. That is over: an
+// attachment now has to be backed by an object key the account owns, so a
+// reference is turned into bytes here and uploaded with the turn. See
+// minimax.UploadedImage.
+//
+// Two forms are accepted and only two — a `data:` URI, which already carries
+// its bytes, and an http(s) URL, which the gateway fetches. Neither needs the
+// media public base URL any more, and nothing is written to the media
+// directory: the bytes go to the object store, not to disk.
+//
+// Fetching a caller-supplied URL is new, and it is worth being plain about what
+// that means: the gateway is now the one making the request, so a client key
+// can point it at anything the gateway can reach. Treat the key list with the
+// same care as the account list.
+func (g *Gateway) resolveImage(ctx context.Context, raw string) (minimax.UploadedImage, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return minimax.UploadedImage{}, errors.New("reference image is empty")
+	}
+
+	if strings.HasPrefix(raw, "data:") {
+		mimeType, payload, err := decodeDataURL(raw)
+		if err != nil {
+			return minimax.UploadedImage{}, err
+		}
+		if len(payload) == 0 {
+			return minimax.UploadedImage{}, errors.New("reference image is empty")
+		}
+		return minimax.UploadedImage{
+			Name:     "inline-" + randomID(12) + extensionFor(mimeType),
+			MimeType: mimeType,
+			Size:     int64(len(payload)),
+			Data:     payload,
+		}, nil
+	}
+
+	// Anything that is not a data URI has to be a URL the gateway can fetch.
+	// Without this check the fallthrough is a *value* that looks fine here and
+	// fails upstream naming nothing — and the value it happens to be is a bare
+	// base64 payload, which is what a client sends when it assumes these
+	// endpoints follow the image-edit convention.
+	//
+	// The value is quoted to 60 characters because a base64 payload is
+	// megabytes long and this string reaches the audit log.
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		return minimax.UploadedImage{}, fmt.Errorf(
+			"reference image must be an http(s) URL or a data: URI — the gateway fetches it and uploads it to the agent, so a bare base64 payload or a local path cannot work (got %.60q)",
+			raw)
+	}
+	return g.downloadImage(ctx, raw)
+}
+
+// referenceImageTimeout bounds one fetch. It is deliberately not the request
+// timeout: that one is sized for a conversation turn, and a picture that has
+// not arrived within a minute is not going to.
+const referenceImageTimeout = 60 * time.Second
+
+// maxReferenceImageBytes caps what a reference URL may hand back.
+//
+// The URL comes from the caller, so without a ceiling one request can pull an
+// unbounded stream into memory — before the upstream has seen anything and had
+// a chance to reject it.
+const maxReferenceImageBytes = 32 << 20
+
+// downloadImage fetches a reference picture and returns its bytes.
+//
+// The fetch targets a caller-supplied URL, so it is deliberately paranoid:
+// addresses that resolve to loopback, private or link-local space are refused
+// at dial time (see minimax.DownloadClient — the check runs on the resolved
+// address, so a DNS name that rebinding-resolves to an intranet host is caught
+// too), and a transport failure is reported generically. A dial error names
+// the address that was tried and whether the port answered — exactly the
+// feedback an intranet sweep wants — so the detail goes to the server log and
+// the caller gets the same answer for every unreachable target.
+func (g *Gateway) downloadImage(ctx context.Context, raw string) (minimax.UploadedImage, error) {
+	settings := g.settings()
+	ctx, cancel := context.WithTimeout(ctx, referenceImageTimeout)
+	defer cancel()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	if err != nil {
+		return minimax.UploadedImage{}, fmt.Errorf("reference image URL is not usable: %w", err)
+	}
+	// The media client is the one that knows about the egress proxy, and the
+	// reference is as likely to be behind the geo-fence as anything else this
+	// gateway fetches.
+	response, err := minimax.DownloadClient(settings).Do(request)
+	if err != nil {
+		log.Printf("reference image fetch failed for %s: %v", redactedURL(raw), err)
+		if errors.Is(err, minimax.ErrPrivateAddress) {
+			return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: that address is not allowed")
+		}
+		return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: the image server could not be reached")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: HTTP %d", response.StatusCode)
+	}
+
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxReferenceImageBytes+1))
+	if err != nil {
+		return minimax.UploadedImage{}, fmt.Errorf("fetch reference image: %w", err)
+	}
+	if len(payload) == 0 {
+		return minimax.UploadedImage{}, errors.New("fetch reference image: the server returned no content")
+	}
+	if len(payload) > maxReferenceImageBytes {
+		return minimax.UploadedImage{}, fmt.Errorf(
+			"reference image is larger than %d MB", maxReferenceImageBytes>>20)
+	}
+
+	mimeType := strings.TrimSpace(response.Header.Get("content-type"))
+	if index := strings.Index(mimeType, ";"); index >= 0 {
+		mimeType = strings.TrimSpace(mimeType[:index])
+	}
+	if mimeType == "" || mimeType == "application/octet-stream" {
+		// Plenty of CDNs answer with a generic type. The extension is a better
+		// guess than calling every png an octet stream — the upstream reads
+		// this field to decide how to hand the picture to the model.
+		if guessed := mime.TypeByExtension(filepath.Ext(imageName(raw))); guessed != "" {
+			mimeType = guessed
+		}
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	return minimax.UploadedImage{
+		Name:     imageName(raw),
+		MimeType: mimeType,
+		Size:     int64(len(payload)),
+		Data:     payload,
+	}, nil
+}
+
+// referenceRequest is the reference-picture fields a generation request may
+// carry, in every spelling the gateway accepts.
+//
+// Three names for one idea, because nothing standard covers it: `image_url` is
+// what this gateway's video endpoint has always taken, `image_urls` is its
+// plural, and `image` is the field OpenAI's own image-edit surface uses — which
+// is what a client that already has one of these wired up will send.
+//
+// They are additive rather than mutually exclusive. A request that fills in two
+// of them is asking for the union, and silently dropping one of a caller's
+// pictures because it arrived under the other name is the kind of help nobody
+// wants.
+type referenceRequest struct {
+	Image     string   `json:"image"`
+	ImageURL  string   `json:"image_url"`
+	ImageURLs []string `json:"image_urls"`
+}
+
+// collect flattens the spellings into one ordered list.
+func (r referenceRequest) collect() []string {
+	out := make([]string, 0, len(r.ImageURLs)+2)
+	for _, raw := range append([]string{r.Image, r.ImageURL}, r.ImageURLs...) {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// resolveReferences turns the reference fields into turn attachments.
+//
+// It is the only path from a request field to a reference picture, so that the
+// two generation endpoints cannot drift apart on what they accept or on how
+// many they keep.
+func (g *Gateway) resolveReferences(ctx context.Context, model *store.ModelConfig, request referenceRequest) ([]minimax.UploadedImage, []minimax.Adjustment, error) {
+	raw := request.collect()
+	keep, adjustments := referenceLimit(model, len(raw))
+	raw = raw[:keep]
+	images := make([]minimax.UploadedImage, 0, len(raw))
+	for _, reference := range raw {
+		image, err := g.resolveImage(ctx, reference)
+		if err != nil {
+			return nil, nil, err
+		}
+		images = append(images, image)
+	}
+	return images, adjustments, nil
+}
+
+// referenceLimit reports how many references to keep, and whether that is fewer
+// than were sent.
+//
+// It returns a count rather than a trimmed slice because the two callers hold
+// different things — one has the request fields, the other has already resolved
+// attachments — and the count is the part that has to agree. It is also the
+// part that gets reported: "asked for 5, used 2" is the fact, and it is gone
+// once the list is trimmed.
+//
+// A picture beyond the cap does not degrade the turn, it stops it: the plugin
+// answers an attachment it has nowhere to put by asking the caller which one
+// they meant, and an API call has nobody to answer. Keeping the first N is the
+// right half to keep for the one model that has a cap — H3-Max animates a first
+// and a last frame, and the caller decides which is which by the order they
+// send them.
+func referenceLimit(model *store.ModelConfig, count int) (int, []minimax.Adjustment) {
+	if cap := model.MaxReferences; cap > 0 && count > cap {
+		return cap, []minimax.Adjustment{minimax.ReferenceAdjustment(count, cap)}
+	}
+	return count, nil
+}
+
+// modelSelection turns a request's thinking and context wishes into the two
+// values the message body's model object carries.
+//
+// Thinking is a request field now, not a catalogue entry: upstream it is a
+// `variant` on the model object, and "thinking" is one of its values. A model
+// that forces thinking on cannot honour `false`, so the gateway asks for the
+// only variant it has instead of sending a value the upstream would reject; a
+// model with no thinking control gets no variant at all.
+//
+// Context is repaired rather than rejected, the same rule the video ranges
+// follow: the caller's number is snapped to the nearest size the model offers.
+// Zero means "no preference" and stays zero, which omits the field and leaves
+// the upstream default in place.
+func modelSelection(model *store.ModelConfig, thinking *bool, contextWindow int) (*string, int) {
+	var variant *string
+	switch model.ThinkingMode {
+	case "forced_on":
+		on := "thinking"
+		variant = &on
+	case "switchable":
+		if thinking != nil {
+			value := ""
+			if *thinking {
+				value = "thinking"
+			}
+			variant = &value
+		}
+	case "forced_off":
+		off := ""
+		variant = &off
+	}
+	if contextWindow <= 0 {
+		return variant, 0
+	}
+	if len(model.ContextWindows) > 0 {
+		return variant, nearestInt(model.ContextWindows, contextWindow)
+	}
+	if model.ContextLimit > 0 {
+		return variant, model.ContextLimit
+	}
+	return variant, 0
+}
+
+// nearestInt picks the closest value in values, which the callers guarantee is
+// non-empty and ordered by nothing in particular.
+func nearestInt(values []int, want int) int {
+	best := values[0]
+	for _, value := range values[1:] {
+		if distance(value, want) < distance(best, want) {
+			best = value
+		}
+	}
+	return best
+}
+
+func distance(a, b int) int {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+// redactedURL strips the query and userinfo from a URL before it reaches a
+// log line. Reference URLs are caller-supplied and routinely carry presigned
+// query parameters or even inline credentials; the host and path are all a
+// transport diagnosis needs.
+func redactedURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "<unparsable URL>"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+// imageName derives a filename from a URL, falling back to a stable default.
+func imageName(raw string) string {
+	index := strings.LastIndex(raw, "/")
+	if index < 0 {
+		return "image.png"
+	}
+	candidate := raw[index+1:]
+	if query := strings.Index(candidate, "?"); query >= 0 {
+		candidate = candidate[:query]
+	}
+	if candidate == "" {
+		return "image.png"
+	}
+	return candidate
+}
+
+func parseContent(raw json.RawMessage) (string, []string, []contentPart) {
+	if len(raw) == 0 {
+		return "", nil, nil
+	}
+	var plain string
+	if err := json.Unmarshal(raw, &plain); err == nil {
+		return plain, nil, nil
+	}
+	var parts []contentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", nil, nil
+	}
+	var text strings.Builder
+	var urls []string
+	var files []contentPart
+	for _, part := range parts {
+		switch part.Type {
+		case "text", "input_text":
+			text.WriteString(part.Text)
+		case "image_url", "input_image":
+			if part.ImageURL.URL != "" {
+				urls = append(urls, part.ImageURL.URL)
+			}
+		case "file", "input_file":
+			// OpenAI file parts: `file.file_id` references a /v1/files upload,
+			// `file.file_data` carries an inline data URL. Kept as-is here —
+			// resolving needs the gateway (the file registry), which this
+			// package-level helper cannot see.
+			if part.File.FileID != "" || part.File.FileData != "" {
+				files = append(files, part)
+			}
+		}
+	}
+	return text.String(), urls, files
+}
+
+// ------------------------------------------------------------ image handler
+
+// imageModelID is the catalogue entry image generation runs under.
+//
+// One id, not a family: image generation is a single capability upstream, so
+// there is nothing to choose between. The entry still earns its place — it is
+// what the console can switch off and what usage is counted against.
+const imageModelID = "minimax-image"
+
+type imageRequest struct {
+	Prompt string `json:"prompt"`
+	// N and Model are accepted and ignored.
+	//
+	// Image generation has exactly one model, and how many pictures come back
+	// is the upstream's decision rather than a parameter. Honouring either
+	// could therefore only ever mean rejecting the value the client guessed.
+	// Read `imageModelID` for what actually runs.
+	N              int    `json:"n"`
+	ResponseFormat string `json:"response_format"`
+	Model          string `json:"model"`
+	// The reference pictures, in every spelling the gateway accepts. This is
+	// what makes an image turn an edit: the pictures ride along as attachments
+	// and the agent reads them, so "生成" and "参考这张改" are the same request
+	// with and without them.
+	referenceRequest
+}
+
+// imageModel returns the catalogue entry image generation runs under.
+func (g *Gateway) imageModel() (*store.ModelConfig, error) {
+	model, ok := g.store.ModelByID(imageModelID)
+	if !ok || !model.Enabled {
+		return nil, errors.New("image generation is disabled")
+	}
+	return model, nil
+}
+
+// runImageTurn sends one image request through the pool and reports what came
+// back. It does no authentication, no limiting and no auditing, because it is
+// called from two endpoints whose request shapes have nothing in common and
+// only agree from here down.
+func (g *Gateway) runImageTurn(
+	ctx context.Context,
+	prompt string,
+	images []minimax.UploadedImage,
+) (*minimax.Result, string, error) {
+	settings := g.settings()
+	var (
+		lastErr     error
+		accountName string
+		result      *minimax.Result
+	)
+
+	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		// A caller that hung up mid-turn must not cost another account: without
+		// this check every remaining attempt would lease, fail on the cancelled
+		// context and release again, spending accounts to learn nothing.
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			break
+		}
+		lease, err := g.pool.Acquire(ctx, "")
+		if err != nil {
+			lastErr = err
+			break
+		}
+		accountName = displayName(lease.Account)
+		result, err = g.client.Completion(ctx, minimax.Options{
+			Credential:  CredentialOf(lease.Account),
+			Text:        prompt,
+			Mode:        "image",
+			Images:      images,
+			Timeout:     settings.RequestTimeout(),
+			IdleTimeout: settings.StreamIdleTimeout(),
+		})
+		lease.Release(err)
+
+		lastErr = err
+		// Same rule as runTurn and the video path: a refusal is the request's
+		// fault, so trying it on the next account only spends one more.
+		if err == nil || isPoolExhausted(err) || errors.Is(err, minimax.ErrUpstreamRejected) {
+			break
+		}
+	}
+
+	if lastErr != nil {
+		return nil, accountName, lastErr
+	}
+	return result, accountName, nil
+}
+
+// chatImage answers a chat completion whose model is an image model.
+//
+// Both ends are translations. The request is a conversation, but an image turn
+// has no use for one — only the flattened prompt and any attached picture
+// survive. The response is a chat message, but the product is pictures, and an
+// OpenAI chat response has nowhere to put one: the only shape every client
+// already renders is markdown, so that is what the pictures travel in.
+//
+// A turn that produced nothing is still a 200 carrying the agent's own words.
+// That is deliberate and matches the video endpoint: the agent is the only
+// party that knows *why* nothing came back, and turning its explanation into an
+// error code would throw away the one useful thing the turn produced.
+func (g *Gateway) chatImage(
+	out *respWriter,
+	r *http.Request,
+	key *store.ClientKey,
+	model *store.ModelConfig,
+	request chatRequest,
+	prompt string,
+	images []minimax.UploadedImage,
+	body []byte,
+	started time.Time,
+) {
+	result, accountName, err := g.runImageTurn(r.Context(), prompt, images)
+	if err != nil {
+		g.recordAudit(r, key, model, accountName, started, upstreamStatus(err), 0, 0, 0, request.Stream, 0, string(body), "", err.Error())
+		if out.wroteHeader {
+			writeSSEError(out, err.Error())
+			return
+		}
+		writeError(out, upstreamStatus(err), err.Error())
+		return
+	}
+
+	urls := g.absoluteMediaURLs(r, g.persistMediaList(result.Media, prompt, model.ID, accountName))
+	content := mediaMarkdown(result.Text, urls)
+	promptTokens := estimateTokens(prompt)
+
+	g.store.RecordModelUsage(model.ID, 1, 0)
+	g.store.BumpClientKeyUsage(key.ID)
+
+	if request.Stream {
+		// Nothing streamed as it arrived — an image turn is one blocking call —
+		// so the whole message goes out as a single chunk before the stream is
+		// closed. The role frame rides along via the stream's lazy emit.
+		stream := newSSEStream(out, model)
+		stream.delta(map[string]any{"content": content}, nil)
+		stream.finish(nil, nil, streamUsage(request, promptTokens, 0))
+		g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, promptTokens, 0, true, 0, string(body), content, "")
+		return
+	}
+
+	response := map[string]any{
+		"id":      "chatcmpl-" + randomID(12),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model.ID,
+		"choices": []any{
+			map[string]any{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": content},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": 0,
+			"total_tokens":      promptTokens,
+		},
+	}
+	if len(urls) > 0 {
+		response["media"] = urls
+	}
+	raw, _ := json.Marshal(response)
+	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, promptTokens, 0, false, 0, string(body), string(raw), "")
+
+	out.Header().Set("content-type", "application/json")
+	out.WriteHeader(http.StatusOK)
+	_, _ = out.Write(raw)
+}
+
+// mediaMarkdown renders one chat message out of what an image turn produced.
+//
+// The agent's prose goes first and the pictures after it, in that order,
+// because the prose is where a refusal or a caveat lives and nobody reads a
+// caveat placed underneath four images. A turn with neither still has to say
+// something: an empty assistant message reads as a client-side bug and sends
+// the caller looking in the wrong place.
+func mediaMarkdown(prose string, urls []string) string {
+	var builder strings.Builder
+	if trimmed := strings.TrimSpace(prose); trimmed != "" {
+		builder.WriteString(trimmed)
+	}
+	for _, url := range urls {
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString("![](" + url + ")")
+	}
+	if builder.Len() == 0 {
+		return "The upstream turn produced neither an image nor an explanation."
+	}
+	return builder.String()
+}
+
+// absoluteMediaURLs makes stored media fetchable by the caller.
+//
+// Stored media is served from this gateway at a path, and a path is worthless
+// in a chat message: the client renders markdown in its own context, where
+// `/media/…` points at nothing. The configured public base URL wins when there
+// is one, because that is the address the operator has declared reachable;
+// otherwise the request's own origin is used, which is right both for a direct
+// call and for a proxy that passes the original host through.
+func (g *Gateway) absoluteMediaURLs(r *http.Request, urls []string) []string {
+	base := strings.TrimRight(strings.TrimSpace(g.settings().Media.PublicBaseURL), "/")
+	if base == "" {
+		base = requestBase(r)
+	}
+	out := make([]string, 0, len(urls))
+	for _, url := range urls {
+		if base != "" && strings.HasPrefix(url, "/") {
+			url = base + url
+		}
+		out = append(out, url)
+	}
+	return out
+}
+
+// requestBase reconstructs the origin the caller reached us on, preferring the
+// proxy's view when there is one.
+func requestBase(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := firstHeaderValue(r, "X-Forwarded-Proto"); forwarded == "http" || forwarded == "https" {
+		scheme = forwarded
+	}
+	host := firstHeaderValue(r, "X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+	if host == "" {
+		return ""
+	}
+	return scheme + "://" + host
+}
+
+// firstHeaderValue reads the first entry of a possibly comma-joined header.
+func firstHeaderValue(r *http.Request, name string) string {
+	raw := r.Header.Get(name)
+	if index := strings.Index(raw, ","); index >= 0 {
+		raw = raw[:index]
+	}
+	return strings.TrimSpace(raw)
+}
+
+// ImageGenerations implements POST /v1/images/generations.
+func (g *Gateway) ImageGenerations(w http.ResponseWriter, r *http.Request) {
+	out := &respWriter{ResponseWriter: w}
+	started := time.Now()
+
+	key, err := g.authenticate(r)
+	if err != nil {
+		writeError(out, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if err := g.limiter.acquire(key); err != nil {
+		writeError(out, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	defer g.limiter.release(key)
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	var request imageRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		writeError(out, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(request.Prompt) == "" {
+		writeError(out, http.StatusBadRequest, "prompt is required")
+		return
+	}
+
+	model, err := g.imageModel()
+	if err != nil {
+		writeError(out, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+
+	images, adjustments, err := g.resolveReferences(r.Context(), model, request.referenceRequest)
+	if err != nil {
+		writeError(out, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	settings := g.settings()
+	result, accountName, err := g.runImageTurn(r.Context(), request.Prompt, images)
+	if err != nil {
+		g.recordAudit(r, key, model, accountName, started, upstreamStatus(err), 0, 0, 0, false, 0, string(body), "", err.Error())
+		writeError(out, upstreamStatus(err), err.Error())
+		return
+	}
+
+	// stored keeps the raw /media/ paths (b64 reads the local file from them);
+	// urls is the same list absolutized, because a bare path is worthless to a
+	// client that is not this machine. The chat endpoint already answered with
+	// absolute URLs; the dedicated endpoint answering with paths was an
+	// inconsistency a non-OpenAI-shaped client could trip over.
+	stored := g.persistMediaList(result.Media, request.Prompt, model.ID, accountName)
+	urls := g.absoluteMediaURLs(r, stored)
+	items := make([]any, 0, len(urls))
+	for index, url := range urls {
+		if request.ResponseFormat == "b64_json" && index < len(stored) && strings.HasPrefix(stored[index], "/media/") {
+			path := filepath.Join(settings.Media.GeneratedDir, filepath.Base(stored[index]))
+			if data, err := os.ReadFile(path); err == nil {
+				items = append(items, map[string]any{"b64_json": base64.StdEncoding.EncodeToString(data)})
+				continue
+			}
+		}
+		source := ""
+		if index < len(result.Media) {
+			source = result.Media[index].URL
+		}
+		items = append(items, map[string]any{"url": url, "source_url": source})
+	}
+
+	g.store.RecordModelUsage(model.ID, 1, 0)
+	g.store.BumpClientKeyUsage(key.ID)
+	response := map[string]any{"created": time.Now().Unix(), "data": items}
+	// Same contract as the video endpoint: the key is absent when nothing was
+	// changed, and present only when the gateway did something the caller did
+	// not ask for.
+	if len(adjustments) > 0 {
+		response["adjusted"] = adjustments
+	}
+	raw, _ := json.Marshal(response)
+	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, 0, 0, false, 0, string(body), string(raw), "")
+
+	out.Header().Set("content-type", "application/json")
+	out.WriteHeader(http.StatusOK)
+	_, _ = out.Write(raw)
+}
+
+// ------------------------------------------------------------ video handler
+
+// videoRequest is the body of POST /v1/videos/generations.
+//
+// The shape follows the OpenAI image endpoint rather than any MiniMax one,
+// because there is no MiniMax video endpoint to follow: the parameters below
+// are the four keys the plugin's own options block accepts, plus the prompt.
+type videoRequest struct {
+	Prompt string `json:"prompt"`
+	Model  string `json:"model"`
+	// Duration is whole seconds. It has no default worth guessing: the upstream
+	// bills by it, so an absent value falls back to the console setting and is
+	// reported back in the response.
+	Duration   int    `json:"duration"`
+	Ratio      string `json:"ratio"`
+	Resolution string `json:"resolution"`
+	// Reference frames: a first/last pair on H3-Max, a multi-reference set on
+	// H3.0. Embedded rather than spelled out again, so the two generation
+	// endpoints cannot disagree about what they accept.
+	referenceRequest
+}
+
+// VideoGenerations implements POST /v1/videos/generations.
+//
+// This is a synchronous surface onto an asynchronous upstream. The fast H3
+// variant finishes in about twenty seconds and returns a playable URL in the
+// same turn, which is what this endpoint is for. The slow H3.0 model is
+// documented at 15–30 minutes, and no HTTP response can hold that: the call
+// returns whatever the agent has produced by the timeout — usually a task
+// identifier and a status — so the caller learns the task was accepted and
+// nothing was lost. Treating a slow model as if it were fast would only turn a
+// usable partial answer into a gateway timeout.
+func (g *Gateway) VideoGenerations(w http.ResponseWriter, r *http.Request) {
+	out := &respWriter{ResponseWriter: w}
+	started := time.Now()
+
+	key, err := g.authenticate(r)
+	if err != nil {
+		writeError(out, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if err := g.limiter.acquire(key); err != nil {
+		writeError(out, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	defer g.limiter.release(key)
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	var request videoRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		writeError(out, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(request.Prompt) == "" {
+		writeError(out, http.StatusBadRequest, "prompt is required")
+		return
+	}
+
+	settings := g.settings()
+
+	modelID := request.Model
+	if modelID == "" {
+		modelID = defaultVideoModel
+	}
+	model, ok := g.store.ModelByID(modelID)
+	if !ok || !model.Enabled || model.Type != store.ModelTypeVideo {
+		writeError(out, http.StatusBadRequest, fmt.Sprintf("unknown or disabled video model %q", modelID))
+		return
+	}
+
+	defaults := videoDefaults(settings, model)
+	options, err := (minimax.VideoOptions{
+		Model:      model.UpstreamModel,
+		Ratio:      request.Ratio,
+		Resolution: request.Resolution,
+		Duration:   request.Duration,
+	}).Normalize(defaults)
+	if err != nil {
+		writeError(out, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Filling the gaps is not enough on its own. The console's defaults are a
+	// single global set while the ranges are per model, so a complete request
+	// can still name a value this model does not offer — 2K on the 480P/768P
+	// variant, or a default resolution the chosen model happens not to carry.
+	// Those are repaired here rather than rejected: the plugin answers a value
+	// it cannot use by asking the caller to choose, and a headless caller has
+	// nobody to answer.
+	options, adjustments := options.Conform(videoLimits(model), defaults)
+
+	// Reference frames ride along as ordinary attachments; the plugin reads them
+	// from the turn rather than from the options block, which only carries the
+	// four generation parameters.
+	images, referenceAdjustments, err := g.resolveReferences(r.Context(), model, request.referenceRequest)
+	if err != nil {
+		writeError(out, http.StatusBadRequest, err.Error())
+		return
+	}
+	// One list, not two: a caller filtering `adjusted` by field should not have
+	// to know which part of the request produced the entry. References go first
+	// because they are what the caller notices — a trimmed set changes the
+	// picture, a repaired resolution changes its size.
+	adjustments = append(referenceAdjustments, adjustments...)
+
+	prompt := g.outgoingText(settings, model, request.Prompt, options)
+
+	var (
+		lastErr     error
+		accountName string
+		usedCred    minimax.Credential
+		result      *minimax.Result
+	)
+
+	for attempt := 0; attempt < settings.Routing.MaxAttempts; attempt++ {
+		// Same rule as runImageTurn: a caller that hung up must not spend the
+		// remaining attempts leasing one account after another.
+		if r.Context().Err() != nil {
+			lastErr = r.Context().Err()
+			break
+		}
+		lease, err := g.acquireAccount(r.Context(), "", model)
+		if err != nil {
+			lastErr = err
+			break
+		}
+		accountName = displayName(lease.Account)
+		usedCred = CredentialOf(lease.Account)
+		result, err = g.client.Completion(r.Context(), minimax.Options{
+			Credential:   usedCred,
+			Text:         prompt,
+			Images:       images,
+			ClientIntent: minimax.VideoClientIntent,
+			Timeout:      settings.VideoTimeout(),
+			IdleTimeout:  settings.StreamIdleTimeout(),
+		})
+		lease.Release(err)
+		lastErr = err
+		// Same rule as runTurn: a refusal is the request's fault, so trying it
+		// on the next account only spends one more account.
+		if err == nil || isPoolExhausted(err) || errors.Is(err, minimax.ErrUpstreamRejected) {
+			break
+		}
+	}
+
+	if lastErr != nil {
+		g.recordAudit(r, key, model, accountName, started, upstreamStatus(lastErr), 0, 0, 0, false, 0, string(body), "", lastErr.Error())
+		writeError(out, upstreamStatus(lastErr), lastErr.Error())
+		return
+	}
+
+	// The file a video turn produces is not in the stream. It lands in the
+	// account's drive and is announced by a separate lookup, so a turn can
+	// succeed and still look empty from here. Both sources are merged rather
+	// than one replacing the other: the stream has been known to carry a cover
+	// image, and dropping it because the drive answered too would lose the only
+	// thing that did arrive. A failed lookup is swallowed on purpose — the
+	// turn's own result is the answer, and a broken lookup must not become an
+	// error the caller has to decode.
+	if result.SessionID != "" {
+		if fromDrive, err := g.client.SessionMedia(r.Context(), usedCred, result.SessionID, started.UnixMilli()); err == nil {
+			result.Media = mergeMedia(result.Media, fromDrive)
+		}
+	}
+
+	urls := g.absoluteMediaURLs(r, g.persistMediaList(result.Media, request.Prompt, model.ID, accountName))
+	items := make([]any, 0, len(urls))
+	for index, url := range urls {
+		source := ""
+		if index < len(result.Media) {
+			source = result.Media[index].URL
+		}
+		items = append(items, map[string]any{"url": url, "source_url": source})
+	}
+
+	g.store.RecordModelUsage(model.ID, 1, 0)
+	g.store.BumpClientKeyUsage(key.ID)
+
+	response := map[string]any{
+		"created": time.Now().Unix(),
+		"model":   model.ID,
+		"data":    items,
+		// The parameters the turn actually went out with. This endpoint fills
+		// in whatever the caller omitted and repairs whatever the model does not
+		// accept, and neither is visible in `data` — a video at the wrong
+		// resolution looks like a video. `params` is therefore the only place a
+		// caller can learn what it was billed for, and `adjusted` names the
+		// repairs alone, so an absent key means the request went out as written.
+		"params": map[string]any{
+			"model":      options.Model,
+			"ratio":      options.Ratio,
+			"resolution": options.Resolution,
+			"duration":   options.Duration,
+		},
+	}
+	if len(adjustments) > 0 {
+		response["adjusted"] = adjustments
+	}
+	// A turn that produced no media still returns 200 with an empty `data` and
+	// the agent's own words, because "submitted, here is the task" is a useful
+	// answer and an error code is not.
+	//
+	// `status` is deliberately only two-valued: it reports what this turn
+	// produced, which is the one thing the gateway actually knows. It does NOT
+	// distinguish "a task is running" from "the upstream never executed
+	// anything". That difference lives only in the agent's prose, and a live
+	// check confirmed the second case is real — the account had no connector
+	// tool available, the turn still cost points, and nothing was ever
+	// produced. Guessing between the two by matching keywords in the prose
+	// would be worse than admitting the limit, so `detail` carries the prose
+	// and the caller reads it.
+	if len(items) > 0 {
+		response["status"] = "succeeded"
+	} else {
+		response["status"] = "pending"
+		response["detail"] = result.Text
+	}
+	raw, _ := json.Marshal(response)
+	g.recordAudit(r, key, model, accountName, started, http.StatusOK, 0, 0, 0, false, 0, string(body), string(raw), "")
+
+	out.Header().Set("content-type", "application/json")
+	out.WriteHeader(http.StatusOK)
+	_, _ = out.Write(raw)
+}
+
+// defaultVideoModel is used when a caller names none. It is the fast variant:
+// the only video model that can answer a synchronous request, and the cheapest
+// way for a caller to discover the endpoint works.
+const defaultVideoModel = "minimax-h3-max"
+
+// outgoingText turns a prompt into the text actually sent upstream.
+//
+// For chat models that is the prompt itself. For video models it is a different
+// kind of message entirely: the plugin reference plus the generation parameters,
+// because MiniMax-H3 is not selectable as a model and the parameters have no
+// place in the request body. See internal/minimax/video.go.
+func (g *Gateway) outgoingText(
+	settings config.Settings,
+	model *store.ModelConfig,
+	prompt string,
+	options minimax.VideoOptions,
+) string {
+	if model.Type != store.ModelTypeVideo {
+		return prompt
+	}
+	defaults := videoDefaults(settings, model)
+	filled, err := options.Normalize(defaults)
+	if err != nil {
+		// Only reachable when the catalogue entry names no upstream model, which
+		// no built-in does. The defaults are still the best answer available, and
+		// a turn with an incomplete block produces nothing at all.
+		filled = defaults
+	}
+	// A repair made on this path goes unannounced: a chat turn answers with the
+	// agent's own prose and has no field to report one in. The dedicated video
+	// endpoint does report it; see VideoGenerations.
+	filled, _ = filled.Conform(videoLimits(model), defaults)
+	return minimax.BuildVideoPrompt(prompt, settings.Video.PluginName, filled, settings.Video.OptionsTag)
+}
+
+// videoDefaults is what a video turn falls back to for a parameter the caller
+// left out: the console's defaults, plus the entry's upstream model id.
+func videoDefaults(settings config.Settings, model *store.ModelConfig) minimax.VideoOptions {
+	return minimax.VideoOptions{
+		Model:      model.UpstreamModel,
+		Ratio:      settings.Video.DefaultRatio,
+		Resolution: settings.Video.DefaultResolution,
+		Duration:   settings.Video.DefaultDuration,
+	}
+}
+
+// videoLimits narrows a catalogue entry to the ranges the gateway enforces.
+func videoLimits(model *store.ModelConfig) minimax.VideoLimits {
+	return minimax.VideoLimits{
+		Ratios:      model.Ratios,
+		Resolutions: model.Resolutions,
+		Durations:   model.Durations,
+	}
+}
+
+// timeoutFor picks the budget for one turn.
+//
+// A video turn and a chat turn have nothing in common: a chat turn that takes a
+// minute is broken, and a video turn that takes a minute has not started yet.
+func timeoutFor(settings config.Settings, model *store.ModelConfig) time.Duration {
+	if model.Type == store.ModelTypeVideo {
+		return settings.VideoTimeout()
+	}
+	return settings.RequestTimeout()
+}
+
+// Models implements GET /v1/models.
+func (g *Gateway) Models(w http.ResponseWriter, r *http.Request) {
+	if _, err := g.authenticate(r); err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	data := make([]any, 0, 4)
+	for _, model := range g.store.ListModels() {
+		if !model.Enabled {
+			continue
+		}
+		data = append(data, map[string]any{"id": model.ID, "object": "model", "created": 0, "owned_by": "minimax"})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// Health implements GET /health.
+func (g *Gateway) Health(w http.ResponseWriter, r *http.Request) {
+	total, active, cooldown, disabled, invalid, routable := g.pool.Summary()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"version": Version,
+		"pool": map[string]any{
+			"total": total, "active": active, "cooldown": cooldown,
+			"disabled": disabled, "invalid": invalid, "routable": routable,
+		},
+	})
+}
+
+// ------------------------------------------------------------- media helper
+
+// mergeMedia concatenates two media lists, keeping the first occurrence of each
+// URL.
+//
+// The stream and the drive describe the same turn from two angles, so an overlap
+// is expected rather than exceptional — and a caller that receives the same video
+// twice has no way to tell a duplicate from a second render.
+func mergeMedia(primary, extra []minimax.MediaRef) []minimax.MediaRef {
+	if len(extra) == 0 {
+		return primary
+	}
+	seen := make(map[string]bool, len(primary)+len(extra))
+	out := make([]minimax.MediaRef, 0, len(primary)+len(extra))
+	for _, list := range [][]minimax.MediaRef{primary, extra} {
+		for _, item := range list {
+			if item.URL == "" || seen[item.URL] {
+				continue
+			}
+			seen[item.URL] = true
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// persistMediaList stores every produced item and returns the URL to serve it
+// from. Downloads run three at a time rather than one after another: a turn
+// that produced a video plus its cover used to hold the stream's final chunk
+// hostage for up to three minutes per item while the downloads finished one by
+// one. Results keep the input order regardless of who finished first.
+func (g *Gateway) persistMediaList(media []minimax.MediaRef, prompt, model, account string) []string {
+	urls := make([]string, len(media))
+	if len(media) == 0 {
+		return urls
+	}
+	const maxParallel = 3
+	slots := make(chan struct{}, min(maxParallel, len(media)))
+	var wg sync.WaitGroup
+	for index, item := range media {
+		wg.Add(1)
+		go func(index int, item minimax.MediaRef) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			urls[index] = g.persistMedia(item, prompt, model, account)
+		}(index, item)
+	}
+	wg.Wait()
+	return urls
+}
+
+func (g *Gateway) persistMedia(media minimax.MediaRef, prompt, model, account string) string {
+	settings := g.settings()
+	item := &store.MediaItem{
+		// 128 bits of id. These names are the only thing between a generated
+		// picture and an anonymous GET /media/<name>: they are unauthenticated
+		// by design (the console renders them with plain <img> tags), so the
+		// id has to be unguessable rather than merely random-looking.
+		ID:          "media_" + randomID(32),
+		Kind:        media.Kind,
+		SourceURL:   media.URL,
+		URL:         media.URL,
+		Prompt:      prompt,
+		Model:       model,
+		AccountName: account,
+		CreatedAt:   time.Now(),
+	}
+
+	if settings.Media.AutoDownload {
+		extension := ".bin"
+		switch media.Kind {
+		case "image":
+			extension = ".png"
+		case "video":
+			extension = ".mp4"
+		}
+		filename := item.ID + extension
+		target := filepath.Join(settings.Media.GeneratedDir, filename)
+
+		// Downloads go through the same proxy as the API. Generated media is
+		// served from MiniMax's CDN, and the account's egress fence applies to it
+		// too — so fetching it from the local address fails the same way an
+		// unproxied API call does, as a reset that looks like the CDN is down.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, media.URL, nil)
+		if err == nil {
+			if resp, err := minimax.DownloadClient(settings).Do(req); err == nil {
+				if resp.StatusCode < 400 {
+					if file, err := os.Create(target); err == nil {
+						if _, err := io.Copy(file, io.LimitReader(resp.Body, 256<<20)); err == nil {
+							item.URL = "/media/" + filename
+						} else {
+							_ = os.Remove(target)
+						}
+						_ = file.Close()
+					}
+				}
+				_ = resp.Body.Close()
+			}
+		}
+		cancel()
+	}
+
+	g.store.AddMedia(item)
+	return item.URL
+}
+
+// --------------------------------------------------------------- audit glue
+
+func (g *Gateway) recordAudit(
+	r *http.Request,
+	key *store.ClientKey,
+	model *store.ModelConfig,
+	accountName string,
+	started time.Time,
+	status int,
+	firstTokenMs int64,
+	promptTokens, completionTokens int,
+	stream bool,
+	retries int,
+	requestBody, responseBody, errText string,
+) {
+	settings := g.settings()
+	audit := &store.Audit{
+		ID:               "req_" + randomID(10),
+		CreatedAt:        time.Now(),
+		KeyName:          key.Name,
+		Model:            model.ID,
+		AccountName:      accountName,
+		Status:           status,
+		LatencyMs:        time.Since(started).Milliseconds(),
+		FirstTokenMs:     firstTokenMs,
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		Stream:           stream,
+		Retries:          retries,
+		IP:               clientIP(r, settings.Security.TrustProxy),
+		UserAgent:        r.Header.Get("user-agent"),
+		Error:            errText,
+	}
+	if settings.Audit.RecordBody {
+		audit.RequestBody = clampBody(requestBody, settings.Audit.BodyLimitBytes)
+		audit.ResponseBody = clampBody(responseBody, settings.Audit.BodyLimitBytes)
+	}
+	g.store.AppendAudit(audit)
+}
+
+func clampBody(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	// Cut on a rune boundary: a body truncated mid-character would push
+	// invalid UTF-8 into the audit store and from there into the console.
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + "…"
+}
+
+// ------------------------------------------------------------------ helpers
+
+func (g *Gateway) authenticate(r *http.Request) (*store.ClientKey, error) {
+	raw := strings.TrimSpace(r.Header.Get("authorization"))
+	if raw == "" {
+		raw = strings.TrimSpace(r.Header.Get("x-api-key"))
+	}
+	if len(raw) > 7 && strings.EqualFold(raw[:7], "bearer ") {
+		raw = strings.TrimSpace(raw[7:])
+	}
+	if raw == "" {
+		return nil, fmt.Errorf("missing API key")
+	}
+	key, ok := g.store.ClientKeyByValue(raw)
+	if !ok {
+		return nil, fmt.Errorf("invalid API key")
+	}
+	if !key.Enabled {
+		return nil, fmt.Errorf("API key disabled")
+	}
+	return key, nil
+}
+
+// CredentialOf projects a pooled account into the upstream identity bundle.
+// It is exported because the admin console probes accounts with the same
+// mapping, and a second copy of these eight fields would be a second place to
+// forget when the protocol grows a field.
+func CredentialOf(account *store.Account) minimax.Credential {
+	return minimax.Credential{
+		Region:       account.Region,
+		Token:        account.Token,
+		UserID:       account.UserID,
+		AgentID:      account.AgentID,
+		DeviceID:     account.DeviceID,
+		UUID:         account.UUID,
+		ScreenWidth:  account.ScreenWidth,
+		ScreenHeight: account.ScreenHeight,
+		BaseURL:      account.BaseURL,
+	}
+}
+
+func displayName(account *store.Account) string {
+	if account.Name != "" {
+		return account.Name
+	}
+	if account.Identifier != "" {
+		return account.Identifier
+	}
+	return store.MaskToken(account.Token)
+}
+
+// isPoolExhausted reports whether the failure means "no account to try", which
+// ends the retry loop: waiting out the remaining attempts cannot conjure one.
+// The sentinels are matched by identity, not by message text — an upstream body
+// that happens to contain the phrase must not end a retry loop that could
+// still succeed.
+func isPoolExhausted(err error) bool {
+	return errors.Is(err, pool.ErrNoAccount) ||
+		errors.Is(err, pool.ErrNoCapacity) ||
+		errors.Is(err, errSubscriptionRequired)
+}
+
+// upstreamStatus maps a turn failure onto the status the caller should see.
+//
+// A request the upstream refused is the caller's problem, so the upstream's own
+// status travels back and the caller can fix what it sent. Everything else —
+// a dead account, an exhausted pool, a 5xx — is a gateway failure and stays a
+// 502, because the caller cannot do anything about it. A missing subscription
+// account is the exception: the pool has no capacity of the required kind, so
+// 503 says "try again once a subscribed account is in the pool" rather than
+// "the upstream broke".
+func upstreamStatus(err error) int {
+	if status := minimax.UpstreamStatus(err); status != 0 {
+		return status
+	}
+	if errors.Is(err, errSubscriptionRequired) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+// clientIP reports where a request came from. X-Forwarded-For is only credited
+// when the operator said a trusted proxy sits in front (settings.Security.
+// TrustProxy); without that statement any caller could forge the IP its audit
+// rows carry by sending the header. Even then the LAST entry is used, not the
+// first: an appending proxy adds the client it actually saw to the right-hand
+// end, so the first entry is whatever the caller chose to pre-send.
+func clientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if forwarded := r.Header.Get("x-forwarded-for"); forwarded != "" {
+			parts := strings.Split(forwarded, ",")
+			return strings.TrimSpace(parts[len(parts)-1])
+		}
+	}
+	return remoteHost(r)
+}
+
+func remoteHost(r *http.Request) string {
+	host := r.RemoteAddr
+	if index := strings.LastIndex(host, ":"); index >= 0 {
+		host = host[:index]
+	}
+	return host
+}
+
+func randomID(length int) string {
+	buf := make([]byte, (length+1)/2)
+	// Uniqueness of these ids is load-bearing — media filenames and audit ids
+	// are derived from them — and a timestamp fallback collapses to
+	// microseconds of entropy under concurrent callers. A broken CSPRNG is a
+	// process-wide fault: stop rather than mint colliding ids.
+	if _, err := rand.Read(buf); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
+	return hex.EncodeToString(buf)[:length]
+}
+
+func estimateTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	return len([]rune(text))/2 + 1
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, "encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(raw)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": "minimax2api_error"}})
+}
+
+func writeSSEError(w http.ResponseWriter, message string) {
+	raw, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message}})
+	_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", raw)
+}
