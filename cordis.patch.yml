@@ -127,6 +127,18 @@
               - cline
             concurrency: 6
             sessionHoldMs: 60000
+            # 2026-11-08 修复「upstream stream aborted during thinking (no content emitted)」：
+            # cline 的免费思考模型（nemotron-3.5-super-vl / solar-mini4 / lightning-free）是重思考
+            # 模型，一次回答先吐几百帧 delta.reasoning，收敛后才出正文。此前本路由没写 timeoutMs，
+            # 走 lib/proxy.mjs 的 UPSTREAM_TIMEOUT_MS=120_000 默认值——而 postWithRetry:389 把
+            # AbortSignal.timeout 同时套在 fetch 与响应体流上，思考一旦超过 120s，pipeStream 的
+            # reader.read() 就被掐断，catch 分支问 streamAbortFrame 补一帧「思考阶段断流」，
+            # 用户看到的就是这句报错（真实原因=规则层超时，不是网关吞帧）。对比 loomy=3600000、
+            # qoder=300000，这里给到 600000（10 分钟）：实测 .cline-request-logs.json 里有
+            # durationMs=420796（≈7 分钟）的合法长思考，600s 覆盖它又不至于把真挂起的账号池
+            # 无限拖着。仅放大单次流预算，不改 maxAttempts——连接期重试仍由 cline 包的 6 次
+            # 退避负责；流已开（pipeStream 读响应体）阶段的掐断本就不可重试，放大预算即可。
+            timeoutMs: 600000
             launch:
               command: "C:\\Users\\15940\\.dsh\\cline2api\\cline-proxy.exe"
               args:
@@ -351,6 +363,14 @@
           # （已运行时绝不重复拉起）。它自己负责换号 / 账号轮换 / 上游 429、401、402、403、5xx
           # 的重试与思考档位归一，本层（rules: [qoder2api-hub]）只做参数整形，不叠第二层退避。
           #
+          # 2026-11-08 修复（qoder 模型经常失败的根因，二段定稿）：网关有 cn/intl 两套上游，
+          # 国际版（api3/api2/api1.qoder.sh、openapi.qoder.sh）从国内直连 10s+ 建连后超时
+          # 断联（实测 chat POST 40s 无响应 HTTP=000；TCP/TLS 层其实能通，是出口 IP 被卡）。
+          # 修复 = 让网关上游流量走本机 xray 混合代理 127.0.0.1:10808（见下方 launch.env 的
+          # HTTPS_PROXY/HTTP_PROXY/NO_PROXY），cn 域名旁路保持直连不受影响；默认区域恢复
+          # intl（用户面板原选择）。规则层另有 translateBusinessError / streamAbortFrame
+          # 做断流纵深防御。
+          #
           # 账号来源：qoder2api-hub 启动**不会**自动导入本机凭证（只打日志），需要到面板
           # http://127.0.0.1:8790/ 用「扫描本地凭证」/ OAuth / PAT 导入；面板默认密码 admin
           # （本路由用 --panel-password 钉成 sk-qoder-local，与 route.apiKey 同值好记）。
@@ -367,6 +387,13 @@
               - qoder2api-hub
             concurrency: 4
             sessionHoldMs: 60000
+            # 2026-11-08 二段修复：规则层默认上游超时 120s（lib/proxy.mjs:33
+            # UPSTREAM_TIMEOUT_MS），而 intl 团队账号排队 10605 的等待/重开可达数分钟
+            # （ttft_p90 实测 114s，网关 QUEUE_WAIT_BUDGET_SECS 默认 600s）。120s 会在
+            # 网关把最终「上游排队中」错误帧发出来之前掐断流，客户端只看到
+            # 「upstream stream aborted during thinking」。这里放宽到 5 分钟，并配合
+            # 下方 launch.env 把网关排队预算收敛到 180s，让错误能明确落到客户端。
+            timeoutMs: 300000
             launch:
               # 用系统 Python 跑内嵌源码副本里的 qoder_proxy.py（纯标准库，无需 venv）。
               command: "C:\\Program Files\\Python311\\python.exe"
@@ -382,6 +409,28 @@
                 - "sk-qoder-local"
               # accounts/ / usage/ / 日志按 process.cwd()（=vendor 副本根）解析，必须指到内嵌副本根。
               cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-hub"
+              # 2026-11-08 修复（二段）：国际版上游（api3/api2/api1.qoder.sh、openapi.qoder.sh）
+              # 从国内直连常年 10s+ 建连后超时断联（实测 chat POST 40s 无响应 HTTP=000），
+              # TCP/TLS 层能通、真正的 POST 被出口 IP 卡死。修复：上游流量走本机 xray
+              # 混合代理 127.0.0.1:10808（HTTP CONNECT 与 SOCKS5 同端口，实测经代理 0.6s
+              # 即达）；cn 域名用 NO_PROXY 旁路保持直连（0.02s，xray 挂了也不受影响）。
+              # 网关两条请求路径都吃这套 env：qoder_accounts._opener_for_request() 每请求
+              # 现读 env；主聊天路径的裸 urlopen（默认 opener）也在首次使用时读 env，且
+              # ProxyHandler 每请求调 proxy_bypass()（NO_PROXY 生效，已实测验证）。
+              # 默认区域恢复 intl（用户面板原选择；intl 上游经代理可达后不再需要躲 cn）。
+              env:
+                QD_PROXY_DEFAULT_REALM: "intl"
+                HTTPS_PROXY: "http://127.0.0.1:10808"
+                HTTP_PROXY: "http://127.0.0.1:10808"
+                NO_PROXY: "localhost,127.0.0.1,.qoder.com.cn"
+                # 用户实际持有的套餐区域：国际版独占（Sonus 等）+ 双区模型只充国际版套餐。
+                # issue #89：非此集合的区域禁止自动换区 / 排队耗尽 failover（避免白烧国服慢镜像预算）。
+                # 2026-11-08：国际版修复后开放「国内国际互用」——intl 与 cn 都可作为换区 / 兜底目标。
+                QD_USABLE_REALMS: "intl,cn"
+                # 把排队等待预算从默认 600s 收敛到 90s：超预算网关发明确的
+                # {"error":{"type":"upstream_queued","code":503}} 帧，而不是让客户端空等
+                # 数分钟（配合本路由 timeoutMs=300000，规则层不会先掐断）。
+                QD_QUEUE_WAIT_BUDGET_SECS: "90"
               # /health 在站点根，不在 upstream 之后，所以用 readyUrl。
               readyUrl: "http://127.0.0.1:8790/health"
               readyTimeoutMs: 60000
@@ -543,12 +592,33 @@
           - id: glm-5.2-sft-harmony
             name: GLM-5.2-SFT-Harmony
             maxTokens: 131072
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: openpangu-2.0-pro
             name: OpenPangu-2.0-Pro
             maxTokens: 131072
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: openpangu-2.0-flash
             name: OpenPangu-2.0-Flash
             maxTokens: 131072
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: glm-5.3
             name: GLM-5.3
             maxTokens: 65536
@@ -569,6 +639,79 @@
           - id: kimi-k3
             name: Kimi-K3
             maxTokens: 65536
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: deepseek-v4.1-flash-1017
+            name: DeepSeek-V4.1-Flash-1017
+            maxTokens: 65536
+            # 实测 2026-11-08（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200。
+            # 不声明 reasoningEfforts 会让 pi-ai 解析成 reasoning:false，任何档位请求都在
+            # pi-ai 内部抛 UNSUPPORTED_REASONING_EFFORT（发生在进规则层之前），故必须声明。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            # 上游 /models: supports_images / vision / input_modalities:[text,image]
+            input:
+              - text
+              - image
+          - id: glm-5.3-flash
+            name: GLM-5.3-Flash
+            maxTokens: 65536
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: kimi-k3.1-pro
+            name: Kimi-K3.1-Pro
+            maxTokens: 65536
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: speed
+            name: Speed
+            maxTokens: 65536
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: deepseek-v4-pro-0813
+            name: DeepSeek-V4-Pro-0813
+            maxTokens: 65536
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: deepseek-v4-flash-0731
+            name: DeepSeek-V4-Flash-0731
+            maxTokens: 65536
+            # 2026-11-08 实测（经 8788 codearts 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
       officeace:
         apiKeyEnv: API_RULES_BEARER
         api: openai-completions
@@ -642,6 +785,13 @@
           - id: glm-5.3
             name: GLM-5.3
             maxTokens: 65536
+            # 2026-11-08 实测（经 8788 officeace 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: glm-5.3-zx
             name: GLM-5.3-ZX
             maxTokens: 65536
@@ -658,12 +808,53 @@
           - id: kimi-k3
             name: Kimi-K3
             maxTokens: 65536
+            # 2026-11-08 实测（经 8788 officeace 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: qwen3-30b-a3b
             name: Qwen3-30B-A3B
             maxTokens: 65536
+            # 2026-11-08 实测（经 8788 officeace 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
           - id: qwen3-32b
             name: Qwen3-32B
             maxTokens: 65536
+            # 2026-11-08 实测（经 8788 officeace 路由）：low/medium/high/xhigh/max 全 200
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: deepseek-v4.1-flash-1017
+            name: DeepSeek-V4.1-Flash-1017
+            maxTokens: 65536
+            # 实测 2026-11-08（经 8788 officeace 路由）：low/medium/high/xhigh/max 全 200。
+            # 不声明会让 pi-ai 解析成 reasoning:false，任何档位都在 pi-ai 内部抛
+            # UNSUPPORTED_REASONING_EFFORT（发生在进规则层之前），故必须声明。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: glm-5.3-flash
+            name: GLM-5.3-Flash
+            maxTokens: 65536
+            # 实测 400：该模型「始终思考」，不支持关闭思考；可用 low / high / max
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
       # cline（cline2api）：baseURL 指向本插件 8788 上的 /cline/v1 路由，
       # 该路由在插件启动时自动拉起 cline2api（默认 :3457）。apiKeyEnv 同样是占位 bearer
       # （见上方头注释）。
@@ -826,6 +1017,16 @@
               - text
               - image
 
+            # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
+            # GLM/Kimi 的 medium → high。不声明 off。
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+          - id: raccoon/raccoon-090dd3
+            name: Raccoon-Work-090dd3
+            contextWindow: 1000000
+            maxTokens: 100000
             # raccoon2api 插件会归一化：off/none/minimal → low；low/medium/high 保留；
             # GLM/Kimi 的 medium → high。不声明 off。
             reasoningEfforts:

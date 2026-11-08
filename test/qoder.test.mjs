@@ -12,8 +12,14 @@
  *  3. 给 tools 里不合规的「裸属性表」parameters 补上标准 {type:object, properties} 外壳
  *     （与 officeace.mjs / loomy.mjs 同类修复，纯防御——qoder 自身解析宽容，但补上无害）。
  *  4. null content chunk 归一成空串；finish_reason 兜底。
- *  5. 与 raccoon/loomy 同构：上游自己换号重试，本层只认 429/502/503/504，
+ *  5. 与 raccoon/loomy 同构：上游自己换号重试，本层只认 408/429/5xx，
  *     400 一律不重试（确定性 400 重试只会污染 keep-alive 连接），退避短、不叠预算。
+ *  6. （2026-11-07 修复）流内/HTTP 200 业务错误翻译（translateBusinessError /
+ *     statusForError）：网关在已建好的 SSE 流里投 `{"error":{...}}` 后紧跟 [DONE]，
+ *     此前本层不认 → proxy 补合成 stop → 客户端收到空的「成功」响应（即「qoder 经常失败」）。
+ *  7. （2026-11-07 修复）思考阶段断流兜底（ensureFinishReason(model, meta) + streamAbortFrame）：
+ *     只发过 reasoning_content、没正文没工具调用时拒绝补 stop，改发错误帧，
+ *     避免把思考草稿当最终答案（与 loomy.mjs 的 spark-x2.6 坑同构）。
  *
  * qoder2api-hub 是纯标准库、上游原样 vendored，没有像 loomy2api 那样打「400 瞬时重试」补丁，
  * 因此本测试不校验 vendor 源码内容。运行：node test/qoder.test.mjs
@@ -190,7 +196,76 @@ function cleanTool(name) {
   qoderRules.normalizeDelta(delta2)
   equal('qoder 非空 content 不动', delta2['content'], 'hi')
   check('qoder 支持图片', qoderRules.supportsImages() === true)
-  check('qoder ensureFinishReason', qoderRules.ensureFinishReason() === true)
+  check('qoder ensureFinishReason 无参向后兼容', qoderRules.ensureFinishReason() === true)
+}
+
+// ------------------------------------------------- 流内/JSON 业务错误翻译（2026-11-07 修复）
+{
+  // 网关在已建好的 SSE 流里投的错误帧（qoder_proxy.py:14142-14157）。
+  const upstreamErr = { error: { message: 'upstream stream error: connection reset', type: 'upstream_error', code: 502 } }
+  const t1 = qoderRules.translateBusinessError(upstreamErr)
+  check('qoder 翻译流内 upstream_error', t1 !== undefined && t1.error.code === 502 && t1.error.type === 'upstream_error')
+  check('qoder 翻译保留原始 message', t1 !== undefined && t1.error.message === 'upstream stream error: connection reset')
+
+  // 网关「空上游流」（qoder_proxy.py:14154-14157）——type 是 server_error，无 code。
+  const emptyErr = { error: { message: 'empty upstream stream', type: 'server_error' } }
+  const t2 = qoderRules.translateBusinessError(emptyErr)
+  check('qoder 翻译 empty upstream stream -> 502', t2 !== undefined && t2.error.code === 502)
+
+  // 网关限流帧（qoder_proxy.py:10967-10988）——type=rate_limit_error, code=429。
+  const rateErr = { error: { message: 'upstream rate limit reached for this model; retry in 60s', type: 'rate_limit_error', code: 429 } }
+  const t3 = qoderRules.translateBusinessError(rateErr)
+  check('qoder 翻译 rate_limit_error -> 429', t3 !== undefined && t3.error.code === 429)
+
+  // 整池无可用账号（qoder_proxy.py:13442-13444）——应翻成 503（可重试）。
+  const noAcc = { error: { message: 'no usable account - add or enable one at the dashboard', type: 'server_error' } }
+  const t4 = qoderRules.translateBusinessError(noAcc)
+  check('qoder 翻译 no usable account -> 503', t4 !== undefined && t4.error.code === 503)
+
+  // 正常 completion chunk 不误判。
+  const normal = { choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }] }
+  check('qoder 正常 chunk 不翻译', qoderRules.translateBusinessError(normal) === undefined)
+  // 非 error 对象 / 空值不崩。
+  check('qoder null 不翻译', qoderRules.translateBusinessError(null) === undefined)
+  check('qoder 非 error 帧不翻译', qoderRules.translateBusinessError({ id: 'x' }) === undefined)
+
+  // statusForError：HTTP 200 + 业务错误体给真实状态码。
+  check('qoder statusForError upstream_error -> 502', qoderRules.statusForError(upstreamErr) === 502)
+  check('qoder statusForError rate_limit -> 429', qoderRules.statusForError(rateErr) === 429)
+  check('qoder statusForError no account -> 503', qoderRules.statusForError(noAcc) === 503)
+  check('qoder statusForError 正常体 undefined', qoderRules.statusForError(normal) === undefined)
+}
+
+// ------------------------------------------------- 思考阶段断流兜底（2026-11-07 修复）
+{
+  // 只发过 reasoning_content、没正文没工具调用、没 finish_reason → 拒绝补 stop。
+  const thinkingOnly = { sawFinishReason: false, sentAnything: true, sawContent: false, sawToolCall: false }
+  check('qoder 思考阶段断流不补 stop', qoderRules.ensureFinishReason('Qwen3.8-Max', thinkingOnly) === false)
+  // 已发过正文 → 可以补 stop。
+  const hasContent = { sawFinishReason: false, sentAnything: true, sawContent: true, sawToolCall: false }
+  check('qoder 已发正文断流补 stop', qoderRules.ensureFinishReason('Qwen3.8-Max', hasContent) === true)
+  // 已发过工具调用 → 可以补 stop。
+  const hasTool = { sawFinishReason: false, sentAnything: true, sawContent: false, sawToolCall: true }
+  check('qoder 已发工具调用断流补 stop', qoderRules.ensureFinishReason('Qwen3.8-Max', hasTool) === true)
+  // 已收到 finish_reason → 不干预。
+  const done = { sawFinishReason: true, sentAnything: true, sawContent: true, sawToolCall: false }
+  check('qoder 已收 finish_reason 不干预', qoderRules.ensureFinishReason('Qwen3.8-Max', done) === true)
+  // 没发过任何东西 → 不干预（交给 proxy 默认行为）。
+  const nothing = { sawFinishReason: false, sentAnything: false, sawContent: false, sawToolCall: false }
+  check('qoder 空流不干预', qoderRules.ensureFinishReason('Qwen3.8-Max', nothing) === true)
+
+  // streamAbortFrame：思考阶段断流给错误帧。
+  const frame = qoderRules.streamAbortFrame(thinkingOnly)
+  check('qoder 思考断流给错误帧', frame !== undefined && frame.error.code === 502 && frame.error.type === 'upstream_error')
+  check('qoder 已发正文断流不给错误帧', qoderRules.streamAbortFrame(hasContent) === undefined)
+  check('qoder 已收 finish_reason 不给错误帧', qoderRules.streamAbortFrame(done) === undefined)
+  check('qoder 空流不给错误帧', qoderRules.streamAbortFrame(nothing) === undefined)
+}
+
+// ------------------------------------------------- 重试面扩大到传输层瞬时故障
+{
+  check('qoder 408 可重试', qoderRules.isRetryable({ status: 408 }) === true)
+  check('qoder 500 可重试（整池失败后的瞬时重试）', qoderRules.isRetryable({ status: 500 }) === true)
 }
 
 // ------------------------------------------------- 与 raccoon/loomy 同构：只认「可立刻重来」
@@ -203,7 +278,7 @@ function cleanTool(name) {
   check('qoder 401 不重试', qoderRules.isRetryable({ status: 401 }) === false)
   check('qoder 403 不重试', qoderRules.isRetryable({ status: 403 }) === false)
   check('qoder 200 不重试', qoderRules.isRetryable({ status: 200 }) === false)
-  check('qoder 500 不重试（上游已换号处理过）', qoderRules.isRetryable({ status: 500 }) === false)
+  check('qoder 500 可重试（整池失败后的瞬时重试）', qoderRules.isRetryable({ status: 500 }) === true)
   // 400 一律不重试：空 messages、参数非法是确定性失败，重试不会改变结果。
   check('qoder 400 不重试', qoderRules.isRetryable({ status: 400 }) === false)
   // 退避短一档：账号冷却以百秒计，本层只是磨掉瞬时抖动。
@@ -212,6 +287,105 @@ function cleanTool(name) {
   check('qoder 重试预算 20s', qoderRules.retryBudgetMs({}) === 20_000)
   check('qoder 全局冷却 0（不叠冷却）', qoderRules.cooldownMs() === 0)
   check('qoder 最大尝试 3', qoderRules.maxAttempts() === 3)
+}
+
+// ------------------------------------------------- 网关自定义错误类型（2026-11-08 二段修复）
+{
+  // friendly_upstream_error() / _queue_error_frame() 的真实帧形状。此前除
+  // upstream_empty_response（消息命中 UPSTREAM_BROKEN_RE）外全被吞掉。
+  const cases = [
+    ['upstream_queued', 503, '上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试', 429],
+    ['quota_exhausted', 429, '上游拒绝本次模型额度/套餐权限（112）', 429],
+    ['quota_daily_limit', 429, '上游账号今日请求次数已达上限（110）', 429],
+    ['upstream_transient_error', 502, '上游瞬时错误，请重试', 502],
+    ['upstream_plan_rejected', 402, '上游返回套餐购买/权限入口', 402],
+    ['upstream_empty_response', 502, 'empty upstream stream', 502],
+    ['upstream_incomplete_tool_call', 502, '上游工具调用缺少名称', 502],
+    ['upstream_image_conversion_timeout', 504, '上游图片转换超时', 504],
+    ['version_too_low', 426, '客户端/网关版本过低（430）', 426],
+    ['payload_too_large', 413, '请求体过大', 413],
+    ['content_policy_rejected', 400, '内容策略拒绝', 400],
+    ['invalid_tool_arguments', 400, '工具参数非法', 400],
+  ]
+  for (const [type, code, message, expected] of cases) {
+    const chunk = { error: { message, type, code } }
+    const t = qoderRules.translateBusinessError(chunk)
+    check('qoder 识别网关自定义类型 ' + type,
+      t !== undefined && t.error.code === expected && t.error.message === message)
+    check('qoder statusForError ' + type + ' -> ' + expected,
+      qoderRules.statusForError(chunk) === expected)
+  }
+  // 只有消息关键词、没有自定义 type 的排队帧也要认。
+  const msgOnly = { error: { message: 'upstream rate limit: {"code":"10605","isQueued":true,"retryAfterSeconds":30}', type: 'server_error', code: 502 } }
+  check('qoder 10605 消息关键词也识别', qoderRules.translateBusinessError(msgOnly) !== undefined && qoderRules.translateBusinessError(msgOnly).error.code === 429)
+  check('qoder 10605 statusForError -> 429', qoderRules.statusForError(msgOnly) === 429)
+  check('qoder 排队 429 可重试', qoderRules.isRetryable({ status: 429 }) === true)
+  check('qoder 正常 chunk 仍不翻译',
+    qoderRules.translateBusinessError({ choices: [{ index: 0, delta: { content: 'hi' } }] }) === undefined)
+}
+
+// ------------------------------------------------- 「答一步就停」续推检测（2026-11-08 三段修复）
+{
+  // 正例：有正文、无工具调用、有 stop、正文以意图模式结尾 → 不完整轮
+  const incompleteMeta = {
+    sawFinishReason: true,
+    sentAnything: true,
+    sawContent: true,
+    sawToolCall: false,
+    contentText: '好的，DSH 已经重启了。让我检查一下网关和宿主的状态，确认新的规则层已经生效。',
+  }
+  check('qoder isIncompleteTurn 正例（有文本无工具调用+stop）', qoderRules.isIncompleteTurn('QoDuck', incompleteMeta) === true)
+
+  // 反例 1：有工具调用 → 完整轮
+  const withToolCall = { ...incompleteMeta, sawToolCall: true }
+  check('qoder isIncompleteTurn 反例（有工具调用）', qoderRules.isIncompleteTurn('QoDuck', withToolCall) === false)
+
+  // 反例 2：无正文（只有思考）→ 不算不完整轮
+  const noContent = { ...incompleteMeta, sawContent: false, contentText: '' }
+  check('qoder isIncompleteTurn 反例（无正文）', qoderRules.isIncompleteTurn('QoDuck', noContent) === false)
+
+  // 反例 3：无 finish_reason（断流）→ 不算不完整轮
+  const noFinish = { ...incompleteMeta, sawFinishReason: false }
+  check('qoder isIncompleteTurn 反例（无 finish_reason）', qoderRules.isIncompleteTurn('QoDuck', noFinish) === false)
+
+  // 反例 4：正文不含意图模式 → 不算不完整轮
+  const noIntent = { ...incompleteMeta, contentText: '这是正常的回答，不包含任何意图模式。' }
+  check('qoder isIncompleteTurn 反例（无意图模式）', qoderRules.isIncompleteTurn('QoDuck', noIntent) === false)
+
+  // 反例 5（用户反馈的核心误判）：意图词出现在中间，但最后一句是结论 → 正常回答，不续推
+  const intentMid = { ...incompleteMeta, contentText: '让我解释一下。网关地址是 127.0.0.1:8788，状态正常。' }
+  check('qoder isIncompleteTurn 反例（意图词在中间、末句是结论）', qoderRules.isIncompleteTurn('QoDuck', intentMid) === false)
+
+  // 反例 6：英文 I'll 在中间，末句是结论 → 正常回答
+  const intentMidEn = { ...incompleteMeta, contentText: "I'll explain. The gateway is up and healthy." }
+  check('qoder isIncompleteTurn 反例（英文意图词在中间）', qoderRules.isIncompleteTurn('QoDuck', intentMidEn) === false)
+
+  // 正例 2：最后一句就是意图宣告（说完就停）→ 不完整轮
+  const intentLast = { ...incompleteMeta, contentText: '先看一下日志。让我检查网关状态。' }
+  check('qoder isIncompleteTurn 正例（末句是意图宣告）', qoderRules.isIncompleteTurn('QoDuck', intentLast) === true)
+
+  // 正例 3：英文末句意图宣告
+  const intentLastEn = { ...incompleteMeta, contentText: "Looking at the logs. I'll check the gateway now." }
+  check('qoder isIncompleteTurn 正例（英文末句意图宣告）', qoderRules.isIncompleteTurn('QoDuck', intentLastEn) === true)
+
+  // incompleteTurnMessages：追加助手回复 + 「继续」用户消息
+  const originalMessages = [
+    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'user', content: '检查网关状态' },
+  ]
+  const continuationMessages = qoderRules.incompleteTurnMessages(originalMessages, '让我检查网关状态')
+  check('qoder incompleteTurnMessages 追加 assistant 消息',
+    continuationMessages.length === originalMessages.length + 2 &&
+    continuationMessages[continuationMessages.length - 2].role === 'assistant' &&
+    continuationMessages[continuationMessages.length - 2].content === '让我检查网关状态')
+  check('qoder incompleteTurnMessages 追加 user「继续」消息',
+    continuationMessages[continuationMessages.length - 1].role === 'user' &&
+    continuationMessages[continuationMessages.length - 1].content === '请继续执行你刚才说要做的操作。')
+  check('qoder incompleteTurnMessages 不修改原数组',
+    originalMessages.length === 2)
+
+  // maxIncompleteTurnRetries：返回 1（防止无限循环）
+  check('qoder maxIncompleteTurnRetries = 1', qoderRules.maxIncompleteTurnRetries() === 1)
 }
 
 console.log('\n' + passes + ' passed, ' + failures + ' failed')

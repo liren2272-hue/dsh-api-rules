@@ -75,6 +75,20 @@ VERSION = "1.9.2"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
+# issue #89：用户实际持有的套餐区域（运营侧约束）。非此集合内的区域禁止作为
+# 自动换区 / 排队耗尽 failover 的目标（QD_USABLE_REALMS 为空 = 不限制，回退历史行为）。
+# 例：用户只有国际版套餐时设 "intl"，可避免网关把 QoDuck 等双区模型在 intl 排队
+# 耗尽后错误 failover 到国服（国服账号同样连不上，只是白烧 60-160s 预算）。
+_QD_USABLE_REALMS = {r.strip().lower() for r in
+                     (os.environ.get("QD_USABLE_REALMS") or "").split(",") if r.strip()}
+
+
+def _realm_permitted(realm):
+    """该区域是否为允许接收流量的套餐区域（issue #89）。"""
+    if not _QD_USABLE_REALMS:
+        return True
+    return realm in _QD_USABLE_REALMS
+
 
 def is_model_banned(model):
     """P1-4：True = 该模型在本机被全局封禁，不送去上游。
@@ -245,7 +259,8 @@ def fallback_realm_by_accounts(realm, model):
         if POOL.count_ready(realm, model=model or None) > 0:
             return realm
         other = "intl" if realm == "cn" else "cn"
-        if POOL.count_ready(other, model=model or None) > 0:
+        # issue #89：套餐区域约束——非许可区域（用户无该区套餐）不做自动换区。
+        if _realm_permitted(other) and POOL.count_ready(other, model=model or None) > 0:
             log("auto realm switch (no ready account): realm %s has no usable "
                 "account for %r -> %s" % (realm, model or "?", other), tag="realm")
             return other
@@ -4681,6 +4696,35 @@ def _repair_args_json(raw):
     return None
 
 
+def _repair_tool_args_or_none(args):
+    """原生 tool_calls 参数校验 + 修复，与正文回声路径共用同一套修复器。
+
+    此前 _repair_args_json 只服务于「正文里的工具回声」（parse_leaked_tool_calls /
+    _echo_with_bad_args）。原生结构化 tool_calls 的两个校验点（流式守卫
+    _sse_guard_truncated_tool_args、非流式 aggregate_stream）直接 json.loads，
+    失败即 EmptyToolEcho("truncated_arguments") —— 同一个「内层引号未转义 /
+    尾随逗号」写法在回声路径能救回、在原生路径必然 502。这就是 QoDuck 反复报
+    「上游工具参数被截断或不是合法 JSON」的根因。
+
+    返回合法 JSON 字符串（原样或修好的）；修不好返回 None，调用方保持
+    fail-closed，绝不伪造可执行调用。
+    """
+    text = args if isinstance(args, str) else str(args or "")
+    try:
+        json.loads(text)
+        return text
+    except (TypeError, ValueError):
+        pass
+    fixed = _repair_args_json(text)
+    if fixed is None:
+        return None
+    RECOVERY_STATS["native_args_repaired"] = \
+        RECOVERY_STATS.get("native_args_repaired", 0) + 1
+    log("repaired native tool-call arguments (%d -> %d chars) - issue #112"
+        % (len(text), len(fixed)), level="WARN", tag="chat")
+    return fixed
+
+
 def _salvage_echo_array(rest):
     """宽松重建「[{"name":…,"arguments":"<未转义 JSON>"}]」（issue #60）。
 
@@ -6015,48 +6059,166 @@ def _sse_recover_dsml(frames, allowed_names=None):
 
 
 def _sse_guard_truncated_tool_args(frames):
-    """Validate accumulated native arguments before forwarding terminal success.
+    """扣住原生 tool_call 的 arguments，收尾时校验并按需修复（issue #112）。
 
-    Content/reasoning deltas are never interchanged; completed JSON calls retain
-    streaming latency. An explicit finish does not make malformed JSON valid.
+    旧实现在 validate 之前就 `yield raw`：参数碎片已经到客户端，收尾发现坏
+    JSON 时只能整轮 502，_repair_args_json 那套修复器一点也用不上 —— 同一种
+    「内层引号未转义 / 尾随逗号」写法在正文回声路径能救回、在原生路径必然
+    502。改为与 _sse_guard_nameless_tool_calls 同构的「先扣住、收尾再发」：
+
+      · arguments 分片按 (choice.index, tool_call.index) 攒起来，不立即透传；
+      · 收尾帧（finish_reason / [DONE] / 流结束）合成一条完整 tool_call：
+        合法原样、非法交 _repair_tool_args_or_none 修、修不好才 fail-closed；
+      · content / reasoning_content 永不改动，仍逐帧透传，思考流不受影响。
     """
     calls = {}
-    def validate():
-        for slot in calls.values():
-            args = "".join(slot["args"]).strip()
-            if not args:
-                continue  # No-argument tools are valid; existing adapters use {}.
-            try:
-                json.loads(args)
-            except (TypeError, ValueError):
+    order = []
+    meta = {}
+
+    def note(ci, tc):
+        ti = tc.get("index")
+        ti = ti if isinstance(ti, int) else 0
+        key = (ci, ti)
+        slot = calls.get(key)
+        if slot is None:
+            slot = {"args": [], "id": "", "name": "", "type": "",
+                    "opened": False, "flushed": False}
+            calls[key] = slot
+            order.append(key)
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        if tc.get("id"):
+            slot["id"] = str(tc["id"])
+        if tc.get("type"):
+            slot["type"] = str(tc["type"])
+        if fn.get("name"):
+            slot["name"] = str(fn["name"])
+        piece = fn.get("arguments")
+        if isinstance(piece, str):
+            slot["args"].append(piece)
+        return key, slot
+
+    def final_entry(key):
+        """校验/修复一个调用的 arguments，返回完整的 tool_call delta 条目。"""
+        _ci, ti = key
+        slot = calls[key]
+        args = "".join(slot["args"]).strip()
+        if args:
+            fixed = _repair_tool_args_or_none(args)
+            if fixed is None:
                 raise EmptyToolEcho(len(args), "truncated_arguments")
+            args = fixed
+        fn = {"arguments": args}
+        entry = {"index": ti, "function": fn}
+        if not slot["opened"]:
+            entry["id"] = slot["id"] or _new_id("call_")
+            entry["type"] = slot["type"] or "function"
+            if slot["name"]:
+                fn["name"] = slot["name"]
+        slot["flushed"] = True
+        return entry
+
+    def flush_frame(keys):
+        by_choice = {}
+        for key in keys:
+            by_choice.setdefault(key[0], []).append(final_entry(key))
+        choices = [{"index": ci, "delta": {"tool_calls": entries},
+                    "finish_reason": None}
+                   for ci, entries in by_choice.items()]
+        payload = {"id": meta.get("id") or "chatcmpl-qoder",
+                   "object": "chat.completion.chunk",
+                   "created": meta.get("created") or int(time.time()),
+                   "model": meta.get("model") or "",
+                   "choices": choices}
+        return ("data: " + json.dumps(payload, ensure_ascii=False)
+                + "\n\n").encode("utf-8")
+
     for raw in frames:
-        terminal = False
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        data = strip_data_prefix(text)
+        if data == "[DONE]":
+            pending = [k for k in order if not calls[k]["flushed"]]
+            if pending:
+                yield flush_frame(pending)
+            yield raw
+            continue
         try:
-            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-            data = strip_data_prefix(text)
-            if data == "[DONE]":
-                terminal = True
-            elif data:
-                payload = json.loads(data)
-                for choice in payload.get("choices") or []:
-                    if not isinstance(choice, dict):
+            payload = json.loads(data) if data else None
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            yield raw
+            continue
+        for mk in ("id", "model", "created"):
+            if payload.get(mk):
+                meta[mk] = payload[mk]
+        choices = payload.get("choices") or []
+        if not choices:
+            yield raw
+            continue
+        terminal = any(isinstance(ch, dict) and ch.get("finish_reason")
+                       for ch in choices)
+        rebuilt = []
+        useful = bool(payload.get("usage"))
+        for ch in choices:
+            if not isinstance(ch, dict):
+                rebuilt.append(ch)
+                useful = True
+                continue
+            ci = ch.get("index")
+            ci = ci if isinstance(ci, int) else 0
+            delta = ch.get("delta") if isinstance(ch.get("delta"), dict) else {}
+            tcs = delta.get("tool_calls")
+            body = {k: v for k, v in delta.items() if k != "tool_calls"}
+            if isinstance(tcs, list) and tcs:
+                openings = []
+                keys_here = []
+                for tc in tcs:
+                    if not isinstance(tc, dict):
                         continue
-                    terminal = terminal or bool(choice.get("finish_reason"))
-                    for tc in ((choice.get("delta") or {}).get("tool_calls") or []):
-                        if not isinstance(tc, dict):
-                            continue
-                        key = (choice.get("index", 0), tc.get("index", 0))
-                        slot = calls.setdefault(key, {"args": []})
-                        args = (tc.get("function") or {}).get("arguments")
-                        if isinstance(args, str):
-                            slot["args"].append(args)
-        except (ValueError, TypeError, AttributeError):
-            pass
-        if terminal:
-            validate()
-        yield raw
-    validate()
+                    key, slot = note(ci, tc)
+                    keys_here.append(key)
+                    fn = (tc.get("function")
+                          if isinstance(tc.get("function"), dict) else {})
+                    head = {}
+                    if tc.get("id"):
+                        head["id"] = str(tc["id"])
+                    if tc.get("type"):
+                        head["type"] = str(tc["type"])
+                    if fn.get("name"):
+                        head["function"] = {"name": str(fn["name"])}
+                    if head:
+                        head["index"] = key[1]
+                        openings.append(head)
+                        slot["opened"] = True
+                if terminal:
+                    merged = {}
+                    for head in openings:
+                        merged.setdefault(head["index"], {}).update(head)
+                    for key in keys_here:
+                        entry = final_entry(key)
+                        out = merged.setdefault(key[1], {})
+                        out.update({k: v for k, v in entry.items()
+                                    if k != "function"})
+                        fn_out = dict(out.get("function") or {})
+                        fn_out.update(entry["function"])
+                        out["function"] = fn_out
+                    openings = [merged[i] for i in sorted(merged)]
+                if openings:
+                    body["tool_calls"] = openings
+            ch2 = dict(ch)
+            ch2["delta"] = body
+            rebuilt.append(ch2)
+            if body or ch.get("finish_reason"):
+                useful = True
+        if not useful:
+            continue
+        frame = dict(payload)
+        frame["choices"] = rebuilt
+        yield ("data: " + json.dumps(frame, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
+    pending = [k for k in order if not calls[k]["flushed"]]
+    if pending:
+        yield flush_frame(pending)
 
 
 def _finish_only_frame(payload, finish_reason):
@@ -7990,7 +8152,9 @@ def _alt_realm_ready(realm, model=""):
     base = realm or detect_model_realm(model) or CURRENT_REALM
     base = base if base in ("cn", "intl") else "cn"
     other = "intl" if base == "cn" else "cn"
-    if not other or other == base or exclusive_realm(model):
+    # issue #89：套餐区域约束——非许可区域（用户无该区套餐）不接收排队耗尽 failover。
+    if (not other or other == base or exclusive_realm(model)
+            or not _realm_permitted(other)):
         return ""
     try:
         return other if POOL and POOL.count_ready(other, model=model or None) > 0 else ""
@@ -9594,10 +9758,12 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
     for entry in tool_calls_map.values():
         args = (entry.get("function") or {}).get("arguments") or ""
         if args.strip():
-            try:
-                json.loads(args)
-            except (ValueError, TypeError):
+            # 与流式守卫同源：先试修复器，修不好才 fail-closed（issue #112）。
+            fixed = _repair_tool_args_or_none(args)
+            if fixed is None:
                 raise EmptyToolEcho(len(args), "truncated_arguments")
+            if fixed != args:
+                entry.setdefault("function", {})["arguments"] = fixed
     if tool_calls_map:
         ordered = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
         message["tool_calls"] = ordered

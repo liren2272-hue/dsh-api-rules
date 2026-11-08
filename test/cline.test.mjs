@@ -162,5 +162,126 @@ async function withHealthServer(handler) {
   await upstream.close()
 }
 
+
+// =====================================================================
+// 「把思考过程输出作为答案」回归（2026-11-08）
+//
+// 根因：cline2api 免费模型重思考，思考放在 delta.reasoning（框架只认
+// reasoning_content）；上游常把流掐在纯思考阶段，旧包 ensureFinishReason()
+// 恒 true → pipeStream 补合成 finish_reason:'stop' → 客户端把思考草稿
+// 当成一次干净完成的回答。修复 = 与 loomy/qoder 同族的六钩子 + 镜像语义。
+//
+// 这一段同时是负向对照的判据：把旧版 cline.mjs 装回时，下面这些断言
+// 必须干净 FAIL（旧版缺 5 个钩子、normalizeDelta 不镜像、ensureFinishReason
+// 恒 true）。hook() 守卫保证「缺钩子」只记 FAIL 不会抛崩，便于观察。
+// =====================================================================
+
+function isObj(v) {
+  return v !== null && typeof v === 'object'
+}
+
+// 六个钩子必须齐全（旧版只有 normalizeDelta/finishReason，缺 5 个）。
+const HOOKS = ['translateBusinessError', 'statusForError', 'streamAbortFrame', 'thinkingLimitFrame', 'ensureFinishReason', 'normalizeDelta']
+for (const name of HOOKS) {
+  check('cline 提供钩子 ' + name, typeof clineRules[name] === 'function', 'typeof=' + typeof clineRules[name])
+}
+
+// 缺钩子时返回 undefined，让断言干净 FAIL 而不是抛 TypeError。
+function hook(name, ...args) {
+  if (typeof clineRules[name] !== 'function') return undefined
+  return clineRules[name](...args)
+}
+
+// ---- normalizeDelta: 把 delta.reasoning 镜像成 reasoning_content ----
+{
+  const delta = { content: '', reasoning: '让我仔细想想', reasoning_details: [{ type: 'reasoning.text', text: '让我仔细想想' }] }
+  hook('normalizeDelta', delta)
+  equal('镜像出 reasoning_content', delta['reasoning_content'], '让我仔细想想')
+  check('保留原 reasoning 字段（不改名/不删）', delta['reasoning'] === '让我仔细想想')
+  check('保留原 reasoning_details（不删）', Array.isArray(delta['reasoning_details']) && delta['reasoning_details'].length === 1)
+  hook('normalizeDelta', delta)
+  equal('重复调用幂等（不产生重复字段）', delta['reasoning_content'], '让我仔细想想')
+
+  const delta2 = { reasoning: '新思考', reasoning_content: '已有思考' }
+  hook('normalizeDelta', delta2)
+  equal('已有 reasoning_content 不被覆盖', delta2['reasoning_content'], '已有思考')
+
+  const delta3 = { reasoning: '' }
+  hook('normalizeDelta', delta3)
+  check('空串 reasoning 不镜像', !('reasoning_content' in delta3))
+  const delta4 = { reasoning: null }
+  hook('normalizeDelta', delta4)
+  check('null reasoning 不镜像', !('reasoning_content' in delta4))
+
+  const delta5 = { content: null, reasoning: 'x' }
+  hook('normalizeDelta', delta5)
+  equal('null content 仍归一空串（旧行为保留）', delta5['content'], '')
+  equal('归一同时仍镜像思考', delta5['reasoning_content'], 'x')
+}
+
+// ---- translateBusinessError: 错误帧翻成标准 OpenAI 错误帧 ----
+{
+  check('正常 chunk 不算业务错误', hook('translateBusinessError', { choices: [{ delta: { reasoning: 'x' } }] }) === undefined)
+  check('非对象不算业务错误', hook('translateBusinessError', 'oops') === undefined)
+
+  const disabled = hook('translateBusinessError', { error: { message: 'model cline-pass/deepseek-v4.1-flash is disabled', type: 'invalid_request_error' } })
+  check('disabled 错误帧被翻译', disabled !== undefined && isObj(disabled.error))
+  equal('disabled → type upstream_error', disabled && disabled.error.type, 'upstream_error')
+  equal('disabled → code 400', disabled && disabled.error.code, 400)
+
+  const noAcct = hook('translateBusinessError', { error: { message: 'no active accounts available. Use --login or login first', type: 'server_error' } })
+  equal('no active accounts → 503', noAcct && noAcct.error.code, 503)
+
+  const rate = hook('translateBusinessError', { error: { message: 'rate limit exceeded', type: 'rate_limit_error' } })
+  equal('rate limit → 429', rate && rate.error.code, 429)
+
+  const broken = hook('translateBusinessError', { error: { message: 'upstream stream broken', type: 'upstream_error' } })
+  equal('upstream stream broken → 502', broken && broken.error.code, 502)
+}
+
+// ---- statusForError: 非流式同码 ----
+{
+  equal('statusForError invalid_request → 400', hook('statusForError', { error: { message: 'model is disabled', type: 'invalid_request_error' } }), 400)
+  equal('statusForError no accounts → 503', hook('statusForError', { error: { message: 'no active accounts available' } }), 503)
+  check('statusForError 正常 chunk → undefined', hook('statusForError', { choices: [] }) === undefined)
+}
+
+// ---- streamAbortFrame: 纯思考截断给错误帧，不补 stop ----
+{
+  const pureThinking = { sawFinishReason: false, sentAnything: true, sawContent: false, sawToolCall: false }
+  const frame = hook('streamAbortFrame', pureThinking)
+  check('纯思考断流给出错误帧', frame !== undefined && isObj(frame.error))
+  equal('断流帧 code 502', frame && frame.error.code, 502)
+  check('断流帧文案含 no content emitted', frame !== undefined && /no content emitted/.test(frame.error.message))
+  check('有正文时不给断流帧', hook('streamAbortFrame', { sawFinishReason: false, sentAnything: true, sawContent: true, sawToolCall: false }) === undefined)
+  check('有工具调用时不给断流帧', hook('streamAbortFrame', { sawFinishReason: false, sentAnything: true, sawContent: false, sawToolCall: true }) === undefined)
+  check('有 finish_reason 时不给断流帧', hook('streamAbortFrame', { sawFinishReason: true, sentAnything: true, sawContent: false, sawToolCall: false }) === undefined)
+  check('未发任何东西时不给断流帧', hook('streamAbortFrame', { sawFinishReason: false, sentAnything: false, sawContent: false, sawToolCall: false }) === undefined)
+  check('非对象 meta 不给断流帧', hook('streamAbortFrame', null) === undefined)
+}
+
+// ---- ensureFinishReason: 纯思考截断拒绝补合成 stop ----
+{
+  equal('meta 缺省保持向后兼容 true', hook('ensureFinishReason', 'm', undefined), true)
+  equal('纯思考截断返回 false（不补 stop）', hook('ensureFinishReason', 'm', { sawFinishReason: false, sentAnything: true, sawContent: false, sawToolCall: false }), false)
+  equal('已有 finish_reason 返回 true', hook('ensureFinishReason', 'm', { sawFinishReason: true, sentAnything: true, sawContent: false, sawToolCall: false }), true)
+  equal('有正文返回 true', hook('ensureFinishReason', 'm', { sawFinishReason: false, sentAnything: true, sawContent: true, sawToolCall: false }), true)
+  equal('有工具调用返回 true', hook('ensureFinishReason', 'm', { sawFinishReason: false, sentAnything: true, sawContent: false, sawToolCall: true }), true)
+}
+
+// ---- thinkingLimitFrame: 思考死循环检测 ----
+{
+  check('正常短思考不触发', hook('thinkingLimitFrame', { reasoningText: '让我想想 1+1', reasoningChunks: 3 }) === undefined)
+  check('缺字段不触发', hook('thinkingLimitFrame', {}) === undefined)
+  const gram = 'ABCDEFGHIJKLMNOPQRSTUVWX' // 24 字
+  const loopText = gram.repeat(50) // 1200 字 ≥ TAIL_WINDOW=1000，尾窗内同 gram 出现 >8 次
+  const loopFrame = hook('thinkingLimitFrame', { reasoningText: loopText, reasoningChunks: 50 })
+  check('重复 n-gram 触发死循环帧', loopFrame !== undefined)
+  equal('死循环帧 finish_reason=length', loopFrame && loopFrame.choices[0].finish_reason, 'length')
+  equal('死循环帧 reason=repetition', loopFrame && loopFrame._thinking_loop.reason, 'repetition')
+  const stagFrame = hook('thinkingLimitFrame', { reasoningText: 'once', reasoningChunks: 6001 })
+  equal('停滞兜底 reason=stagnation', stagFrame && stagFrame._thinking_loop.reason, 'stagnation')
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed')
 process.exit(failures === 0 ? 0 : 1)

@@ -37,6 +37,7 @@ const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhi
 //   officeace/glm-5.1                      -> [low, medium, high, xhigh, max]（不接受 none）
 //   officeace/glm-5.2                      -> [minimal, low, medium, high, xhigh, max]（上游接受 none/minimal）
 //   officeace/kimi-k2.6                    -> [low, medium, high, xhigh, max]（不接受 none）
+//   officeace/glm-5.3-flash                -> [low, high, max]（实测 400：始终思考，不支持关闭）
 //   codearts/GLM-5.2                       -> [minimal, low, medium, high, xhigh, max]
 //   codearts/glm-5.3                       -> [low, high, max]
 //   codearts/deepseek-v4.1-flash           -> [low, medium, high, xhigh, max]
@@ -49,6 +50,19 @@ const EXPECTED = new Map([
   ['codearts/GLM-5.2', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['codearts/glm-5.3', ['low', 'high', 'max']],
   ['codearts/deepseek-v4.1-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
+  // 以下 9 个 codearts 模型 2026-11-08 经 8788 codearts 路由实测：low/medium/high/xhigh/max 全 200。
+  // 曾经漏声明的 deepseek-v4.1-flash-1017 就是因为没进白名单、也没人强制分类，才在运行期抛
+  // UNSUPPORTED_REASONING_EFFORT。补全后「每个模型都必须被显式分类」才成立（见文件末尾的全覆盖校验）。
+  ['codearts/deepseek-v4.1-flash-1017', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/kimi-k3', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/glm-5.3-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/kimi-k3.1-pro', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/speed', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/deepseek-v4-pro-0813', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/deepseek-v4-flash-0731', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/glm-5.2-sft-harmony', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/openpangu-2.0-pro', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['codearts/openpangu-2.0-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['officeace/deepseek-v4-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['officeace/deepseek-v4-flash-0731', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['officeace/deepseek-v4.1-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
@@ -56,6 +70,13 @@ const EXPECTED = new Map([
   ['officeace/glm-5.1', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['officeace/glm-5.2', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['officeace/kimi-k2.6', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['officeace/glm-5.3-flash', ['low', 'high', 'max']],
+  // 2026-11-08 实测经 8788 officeace 路由：下列 4 个全部 low/medium/high/xhigh/max = 200。
+  ['officeace/deepseek-v4.1-flash-1017', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['officeace/glm-5.3', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['officeace/kimi-k3', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['officeace/qwen3-30b-a3b', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['officeace/qwen3-32b', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['loomy2api/spark-x2.6', ['low', 'medium', 'high', 'xhigh']],
   ['loomy2api/DeepSeek-V4.1-Flash', ['low', 'medium', 'high', 'xhigh']],
   ['loomy2api/deepseek-v4-flash-0731', ['low', 'medium', 'high', 'xhigh']],
@@ -90,13 +111,16 @@ const EXPECTED = new Map([
   ['raccoon/raccoon/sn-kimi-k3', ['low', 'medium', 'high']],
   ['raccoon/raccoon/sn-sensenova-6-8-flash', ['low', 'medium', 'high']],
   ['raccoon/raccoon/sn-sensenova-6-8-flash-lite', ['low', 'medium', 'high']],
+  ['raccoon/raccoon/raccoon-090dd3', ['low', 'medium', 'high']],
 ])
 
 // 明确不声明的模型（探针实测网关剥离 / 上游忽略 / 无访问 / 动态路由）。
+// 这是「故意不声明」的白名单：凡在 pi-ai 段里出现、但不该有 reasoningEfforts 的模型都必须列在这里，
+// 否则末尾的全覆盖校验会失败——逼着新增模型时显式决定「声明 or 故意不声明」，而不是漏掉。
 const FORBIDDEN = [
-  'officeace/glm-5.2-zx', 'officeace/glm-5.3', 'officeace/glm-5.3-zx',
-  'officeace/kimi-k3', 'officeace/qwen3-30b-a3b', 'officeace/qwen3-32b',
-  'codearts/glm-5.2-sft-harmony', 'codearts/openpangu-2.0-pro', 'codearts/openpangu-2.0-flash', 'codearts/kimi-k3',
+  // officeace：经 8788 路由实测 404（网关不转发 / 上游不提供），无强度档可言。
+  'officeace/glm-5.2-zx', 'officeace/glm-5.3-zx',
+  // loomy2api：qwen-3.8-max 上游未给档位字段；auto 是动态路由，档位不定。
   'loomy2api/qwen-3.8-max', 'loomy2api/auto',
   // qoder2api-hub：无思考配置的模型一律不声明（声明了选择器会出档位菜单、上游却认不了）。
   'qoder2api-hub/Auto', 'qoder2api-hub/Efficient', 'qoder2api-hub/Fast',
@@ -161,6 +185,53 @@ function scanBlocks(src) {
 const blocks = scanBlocks(lines)
 
 check('至少扫到 1 个 reasoningEfforts 块', blocks.length > 0, '找到 ' + blocks.length + ' 个')
+
+// ---- 全覆盖校验（扩展性保证）----
+// 扫出 pi-ai 段里**每个**模型的 id（10 空格 `- id:`，无论有没有 reasoningEfforts），要求它
+// 必须被显式分类：要么进了 EXPECTED（必须声明，且档位集合与实测一致），要么进了 FORBIDDEN
+// （故意不声明）。两者都不在 = 新增模型忘了决定它的思考强度 → 直接失败。
+//
+// 这就是 2026-11-08 那个 bug 的根治：deepseek-v4.1-flash-1017 当初既没声明也没进任何清单，
+// 于是没人发现它缺声明，直到运行期 pi-ai 抛 UNSUPPORTED_REASONING_EFFORT（发生在进规则层
+// 之前，规则层拦不住）。把「分类」变成测试硬门槛后，新增模型一落进 cordis.patch.yml 就必须
+// 同时落进本文件的 EXPECTED 或 FORBIDDEN，漏不掉。
+function scanAllModels(src) {
+  const models = []
+  // 顶层 `- id: llm-pi-ai`（0 缩进）之后，providers 段里的模型条目是 10 空格的 `- id:`。
+  // 顶层 `- id:`（0 缩进）再次出现 = 离开了 llm-pi-ai 块，停。
+  let inPiAi = false
+  let provider = null
+  for (let i = 0; i < src.length; i++) {
+    const line = src[i]
+    if (/^- id: llm-pi-ai\s*$/.test(line)) { inPiAi = true; continue }
+    if (!inPiAi) continue
+    if (/^- id:/.test(line)) break // 下一个顶层补丁条��，llm-pi-ai 段结束
+    const prov = /^ {6}([A-Za-z0-9_-]+):\s*$/.exec(line)
+    if (prov) { provider = prov[1]; continue }
+    const model = /^ {10}- id:\s*(.+?)\s*$/.exec(line)
+    if (model && provider) models.push({ provider, id: model[1].trim() })
+  }
+  return models
+}
+
+const allModels = scanAllModels(lines)
+const declaredIds = new Set(blocks.map((b) => `${b.provider}/${b.modelId}`))
+const forbiddenSet = new Set(FORBIDDEN)
+const expectedSet = new Set(EXPECTED.keys())
+
+for (const { provider, id } of allModels) {
+  const fullId = `${provider}/${id}`
+  const classified = expectedSet.has(fullId) || forbiddenSet.has(fullId)
+  check(`模型 ${fullId} 已被分类（EXPECTED 或 FORBIDDEN）`, classified,
+    '既不在 EXPECTED 也不在 FORBIDDEN —— 新增模型必须显式决定它的思考强度档位；' +
+    '支持档位就量一遍加进 EXPECTED 并在 cordis.patch.yml 声明，不支持/不转发就加进 FORBIDDEN')
+  if (!declaredIds.has(fullId)) {
+    check(`未声明的 ${fullId} 必须在 FORBIDDEN 里`, forbiddenSet.has(fullId),
+      '该模型没有 reasoningEfforts 块，也没进 FORBIDDEN —— 要么补声明+进 EXPECTED，要么进 FORBIDDEN')
+  }
+}
+
+check('全覆盖扫描至少覆盖到 1 个模型', allModels.length > 0, '扫到 ' + allModels.length + ' 个')
 
 // 扫描器必须恰好命中白名单里的模型
 const found = blocks.map((b) => `${b.provider}/${b.modelId}`).sort()
