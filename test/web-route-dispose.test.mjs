@@ -55,15 +55,15 @@ test('inject 回调交还 disposer，重载不撞重复路由', async (t) => {
   const config = { port: 8788, routes: [{ id: 'codearts', signer: 'huawei', rules: ['codearts'] }] }
 
   apply(makeCtx(webServer, disposers), config)
-  assert.equal(webServer.table.size, 3, '三条路由应全部注册')
+  assert.equal(webServer.table.size, 4, '四条路由应全部注册')
   assert.ok(webServer.table.has('exact /api/api-rules/accounts'))
 
   // 模拟 HMR：先跑旧条目的清理函数，再 apply 一次。
   disposers[0]()
-  assert.equal(webServer.table.size, 0, 'disposer 必须把三条路由全部摘掉')
+  assert.equal(webServer.table.size, 0, 'disposer 必须把四条路由全部摘掉')
 
   assert.doesNotThrow(() => apply(makeCtx(webServer, disposers), config), '重载不应撞 duplicate route')
-  assert.equal(webServer.table.size, 3, '重载后仍是三条路由')
+  assert.equal(webServer.table.size, 4, '重载后仍是四条路由')
 })
 
 test('重复注册同一路径确实会抛错（负向对照，证明上面的断言不是空转）', async (t) => {

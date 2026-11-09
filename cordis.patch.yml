@@ -377,6 +377,9 @@
             apiKey: "sk-mm-local"
             # 面板本身走密码登录，这是「打开管理面板」的跳转入口，不是登录凭证。
             adminUrl: "http://127.0.0.1:8080/"
+            # 管理员密码（MINIMAX2API_ADMIN_PASSWORD），供插件的 /api/api-rules/minimax-account
+            # 端点代登录后调用 minimax2api 的 /admin/api/* 管理账号。绝不回传给卡片。
+            adminPassword: "sk-mm-local"
             rules:
               - minimax2api
             concurrency: 4
