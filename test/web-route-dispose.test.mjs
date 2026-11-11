@@ -10,9 +10,9 @@
 // 且第一遍的 handler 必须已被摘掉。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 
 /** 复刻宿主 dsh-host-webserver 的语义：重复 (kind, path) 抛错，register 返回摘除函数。 */
 function createFakeWebServer() {
@@ -27,6 +27,16 @@ function createFakeWebServer() {
     },
   }
 }
+
+/** 新增路由时同步改这里，并补一条对应的 has 断言。 */
+const ROUTE_COUNT = 4
+/** 四条路由的完整清单：计数与清单一起维护，新增路由时两边都补。 */
+const ROUTE_PATHS = [
+  '/api/api-rules/accounts',
+  '/api/api-rules/account',
+  '/api/api-rules/codearts-account',
+  '/api/api-rules/minimax-account',
+]
 
 function makeCtx(webServer, disposers) {
   return {
@@ -55,15 +65,19 @@ test('inject 回调交还 disposer，重载不撞重复路由', async (t) => {
   const config = { port: 8788, routes: [{ id: 'codearts', signer: 'huawei', rules: ['codearts'] }] }
 
   apply(makeCtx(webServer, disposers), config)
-  assert.equal(webServer.table.size, 4, '四条路由应全部注册')
-  assert.ok(webServer.table.has('exact /api/api-rules/accounts'))
+  assert.equal(webServer.table.size, ROUTE_COUNT, '四条路由应全部注册')
+  for (const path of ROUTE_PATHS) assert.ok(webServer.table.has('exact ' + path), '缺路由: ' + path)
+  assert.ok(webServer.table.has('exact /api/api-rules/minimax-account'), '新增的 minimax-account 路由必须注册上')
 
   // 模拟 HMR：先跑旧条目的清理函数，再 apply 一次。
   disposers[0]()
   assert.equal(webServer.table.size, 0, 'disposer 必须把四条路由全部摘掉')
+  assert.ok(!webServer.table.has('exact /api/api-rules/minimax-account'), 'unload 后 minimax-account 路由也必须摘掉')
 
   assert.doesNotThrow(() => apply(makeCtx(webServer, disposers), config), '重载不应撞 duplicate route')
-  assert.equal(webServer.table.size, 4, '重载后仍是四条路由')
+  assert.equal(webServer.table.size, ROUTE_COUNT, '重载后仍是四条路由')
+  assert.ok(webServer.table.has('exact /api/api-rules/minimax-account'), '重载后 minimax-account 仍在')
+  for (const dispose of disposers.splice(0)) dispose()
 })
 
 test('重复注册同一路径确实会抛错（负向对照，证明上面的断言不是空转）', async (t) => {
@@ -103,6 +117,11 @@ test('旧闭包 handler 也不能报旧数据：accounts 读的是实时 live �
   const webServer = createFakeWebServer()
   const disposers = []
 
+  // fixture 必须落在 accountPath() 解析出的 <DSH_HOME>/.api-rules/accounts.json 上。
+  const file = join(tmp, '.api-rules', 'accounts.json')
+  mkdirSync(dirname(file), { recursive: true }) // 不先建目录 writeFileSync 会 ENOENT
+  writeFileSync(file, JSON.stringify({ codearts: { ak: 'AK1111', sk: 'SK1111', updatedAt: 1 } }))
+
   // 第一轮：只有 codearts 一条路由，effect 不真起监听（proxy 为 undefined）。
   const configA = { port: 8788, routes: [{ id: 'codearts', signer: 'huawei', rules: ['codearts'] }] }
   apply(makeCtx(webServer, disposers), configA)
@@ -119,6 +138,10 @@ test('旧闭包 handler 也不能报旧数据：accounts 读的是实时 live �
 
   const before = await read(staleHandler)
   assert.equal(before.routes.length, 1)
+  assert.match(before.routes.find((r) => r.id === 'codearts').akHint, /1111$/, '掩码末四位来自本次落盘值')
+
+  // 换一组落盘值：掩码后四位随之改变，闭包读旧快照就会露馅（只断言「不回显明文」会空转）。
+  writeFileSync(file, JSON.stringify({ codearts: { ak: 'AK9999', sk: 'SK9999', updatedAt: 2 } }))
 
   // 第二轮：换成两条路由（模拟 patch 加了 minimax2api 之后重载）。
   disposers[0]()
@@ -135,4 +158,6 @@ test('旧闭包 handler 也不能报旧数据：accounts 读的是实时 live �
   const after = await read(staleHandler)
   assert.equal(after.routes.length, 2, '旧 handler 闭包必须读实时 live.routeConfigs，不能报旧快照')
   assert.ok(after.routes.some((r) => r.id === 'minimax2api'), '新路由必须立刻出现在旧 handler 的响应里')
+  assert.match(after.routes.find((r) => r.id === 'codearts').akHint, /9999$/, '旧闭包必须读到新落盘值')
+  assert.equal(JSON.stringify(after).includes('AK9999'), false, '响应里不得出现 ak 明文')
 })

@@ -386,8 +386,11 @@
             sessionHoldMs: 60000
             timeoutMs: 300000
             launch:
-              command: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\minimax2api\\minimax2api.exe"
+              # 经 node 启动器同时拉起「网关 + 浏览器登录 CDP bridge(:8766)」，
+              # 使浏览器加账号随路由自启自停（此前只起 exe，bridge 丢失导致浏览器登录失效）。
+              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
               args:
+                - "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\minimax2api\\launch-minimax2api.mjs"
                 - "-addr"
                 - "127.0.0.1:8080"
               # app.json / generated/ 按 process.cwd() 解析，必须指到内嵌副本根。
@@ -397,6 +400,9 @@
                 MINIMAX2API_ADMIN_PASSWORD: "sk-mm-local"
                 MINIMAX2API_CLIENT_KEY: "sk-mm-local"
                 MINIMAX2API_CLIENT_KEY_NAME: "dsh"
+                # 本地单机面板：默认关闭管理员登录界面（后端 guard 已默认放行）。
+                # 设 MINIMAX2API_DISABLE_AUTH: "0" 可恢复登录鉴权。
+                MINIMAX2API_DISABLE_AUTH: "1"
                 HTTPS_PROXY: "http://127.0.0.1:10808"
                 HTTP_PROXY: "http://127.0.0.1:10808"
                 NO_PROXY: "localhost,127.0.0.1"
@@ -428,341 +434,102 @@
                 input:
                   - text
                   - image
-
-          # Trae（trae2api-hub）：DSH -> 8788（本插件）-> trae2api-hub :8791。
-          # trae2api-hub 是 Trae IDE 官方客户端的 OpenAI/Anthropic 兼容网关（多账号池 +
-          # Web 面板），源码内嵌在本插件的 vendor/trae2api-hub/。纯标准库 Python，零依赖。
-          # 架构与 qoder2api-hub 同源（trae_*.py 模块），本层（rules: [trae2api-hub]）只做参数整形。
-          # 账号来源：trae2api-hub 启动不会自动导入凭证，需要到面板 http://127.0.0.1:8791/
-          # 添加 Trae 账号（QQ/微信登录或 token）。面板密码 --panel-password 钉成 sk-trae-local。
-          - id: trae2api-hub
-            upstream: "http://127.0.0.1:8791/v1"
-            apiKey: "sk-trae-local"
-            adminUrl: "http://127.0.0.1:8791/"
-            rules:
-              - trae2api-hub
-            concurrency: 4
-            sessionHoldMs: 60000
-            timeoutMs: 300000
+          # qoder2api-hub（EchoPing07/Qoder-2API-Go，Go 重写 fengyinxia/qoder2api，vendor/qoder2api-go/）：
+          # 换掉旧 Zhengyuuuui 桥（UI 丑）。新桥是**单端口** 10081：网关 /v1 + admin 面板 /admin 同端口。
+          # DSH -> 8788（本插件）-> qoder 桥 :10081/v1。launch.mjs 首跑现场 go build（-mod=vendor，离线可编译）。
+          # 鉴权：新桥用面板建的 API key（Bearer，store.go ConstantTimeCompare）；launch.mjs 首跑播种固定
+          # sk-qoder-local 并与 apiKey 对齐。PAT 不是旧桥的 OAuth token，得用户在 /admin 面板手填。
+          - id: qoder2api-hub
+            label: "Qoder"
+            upstream: "http://127.0.0.1:10081/v1"
+            # 与 launch.mjs 播种的固定 key 对齐（QODER_SEED_API_KEY 默认 sk-qoder-local）。
+            apiKey: "sk-qoder-local"
+            # admin 面板（加账号 PAT、建 API key、看用量）；密码由 QODER_ADMIN_PASSWORD 钉住。
+            adminUrl: "http://127.0.0.1:10081/admin"
             launch:
-              command: "C:\\Program Files\\Python311\\python.exe"
+              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
               args:
-                - "trae_proxy.py"
-                - "--host"
-                - "127.0.0.1"
-                - "--port"
-                - "8791"
-                - "--api-key"
-                - "sk-trae-local"
-                - "--panel-password"
-                - "sk-trae-local"
-              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\trae2api-hub"
+                - "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-go\\launch.mjs"
+              # launch.mjs 按 process.cwd() 找源码并 go build -mod=vendor，必须指到内嵌副本根。
+              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-go"
               env:
-                TRAE_PROXY_DEFAULT_REALM: "intl"
+                # 数据库钉进内嵌副本 data/data.json，保持自包含、不写用户家目录。
+                QODER_DATA_PATH: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-go\\data\\data.json"
+                # admin 面板密码固定（避免每次启动随机生成要翻日志）；仍可在面板改。
+                QODER_ADMIN_PASSWORD: "qoder-local"
+                # 本地单机面板：默认关闭管理员登录界面（后端 requireAuth 已默认放行）。
+                # 设 QODER_DISABLE_PANEL_AUTH: "0" 可恢复登录鉴权。
+                QODER_DISABLE_PANEL_AUTH: "1"
                 HTTPS_PROXY: "http://127.0.0.1:10808"
                 HTTP_PROXY: "http://127.0.0.1:10808"
                 NO_PROXY: "localhost,127.0.0.1"
-              readyUrl: "http://127.0.0.1:8791/health"
+              # /health 无鉴权探针（main.go 挂在根 mux）；进程健康即可确认，账号 PAT 后补。
+              readyUrl: "http://127.0.0.1:10081/health"
               readyTimeoutMs: 60000
               readyPollMs: 1000
               killOnStop: true
-            # 模型清单（来自内嵌网关 trae_catalog_cn.json / trae_catalog_intl.json）。
-            # id=display_name（与 /v1/models 默认返回一致），reasoning_model 类型的模型
-            # 同样走 /v1/chat/completions，只是上游自带思考能力。
-            models:
-              - id: Seed-Code
-                contextWindow: 256000
-                maxTokens: 256000
-                input:
-                  - text
-              - id: Kimi-K3
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-              - id: DeepSeek-V4-Flash
-                contextWindow: 116000
-                maxTokens: 116000
-                input:
-                  - text
-              - id: DeepSeek-V4-Pro
-                contextWindow: 116000
-                maxTokens: 116000
-                input:
-                  - text
-              - id: GLM-5.3
-                contextWindow: 116000
-                maxTokens: 116000
-                input:
-                  - text
-              - id: Qwen3.8-Max
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-              - id: Kimi-K2.8-Preview
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-              - id: MiniMax-M3
-                contextWindow: 116000
-                maxTokens: 116000
-                input:
-                  - text
-              - id: Seed-2.1-Pro-0915
-                contextWindow: 256000
-                maxTokens: 256000
-                input:
-                  - text
-              - id: DeepSeek-V3.1-Terminus
-                contextWindow: 136192
-                maxTokens: 136192
-                input:
-                  - text
-              - id: Claude-Opus-4.7
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-              - id: Claude-Sonnet-4.6
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-              - id: GPT-5.5
-                contextWindow: 272000
-                maxTokens: 272000
-                input:
-                  - text
-              - id: GPT-6-Astra
-                contextWindow: 272000
-                maxTokens: 272000
-                input:
-                  - text
-              - id: Gemini-2.5-Pro
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-              - id: Gemini-3.1-Pro-Preview
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-              - id: Grok-4
-                contextWindow: 128000
-                maxTokens: 128000
-                input:
-                  - text
-              - id: Kimi-K2-0905
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-          # Qoder（qoder2api-hub）：DSH -> 8788（本插件，回环转发 + 参数规则）-> qoder2api-hub :8790。
-          #
-          # qoder2api-hub 是 Qoder（qoder.com.cn / qoder.com）官方客户端的 OpenAI/Anthropic
-          # 兼容网关（多账号池 + Web 面板），源码内嵌在本插件的 vendor/qoder2api-hub/
-          # （纯标准库 Python，无第三方依赖），由本路由的 launch 在插件启动时自动拉起
-          # （已运行时绝不重复拉起）。它自己负责换号 / 账号轮换 / 上游 429、401、402、403、5xx
-          # 的重试与思考档位归一，本层（rules: [qoder2api-hub]）只做参数整形，不叠第二层退避。
-          #
-          # 2026-11-08 修复（qoder 模型经常失败的根因，二段定稿）：网关有 cn/intl 两套上游，
-          # 国际版（api3/api2/api1.qoder.sh、openapi.qoder.sh）从国内直连 10s+ 建连后超时
-          # 断联（实测 chat POST 40s 无响应 HTTP=000；TCP/TLS 层其实能通，是出口 IP 被卡）。
-          # 修复 = 让网关上游流量走本机 xray 混合代理 127.0.0.1:10808（见下方 launch.env 的
-          # HTTPS_PROXY/HTTP_PROXY/NO_PROXY），cn 域名旁路保持直连不受影响；默认区域恢复
-          # intl（用户面板原选择）。规则层另有 translateBusinessError / streamAbortFrame
-          # 做断流纵深防御。
-          #
-          # 账号来源：qoder2api-hub 启动**不会**自动导入本机凭证（只打日志），需要到面板
-          # http://127.0.0.1:8790/ 用「扫描本地凭证」/ OAuth / PAT 导入；面板默认密码 admin
-          # （本路由用 --panel-password 钉成 sk-qoder-local，与 route.apiKey 同值好记）。
-          #
-          # 与 loomy 同理：拉起的是**本插件目录里的源码副本**（vendor/qoder2api-hub），
-          # 插件之外没有任何需要保留的文件夹，误删外部目录也不会让 Qoder 失联。
-          # 解释器直接用系统 Python 3.9+（qoder2api-hub 零第三方依赖，不需要 venv）。
-          - id: qoder2api-hub
-            upstream: "http://127.0.0.1:8790/v1"
-            apiKey: "sk-qoder-local"
-            # 面板本身走密码登录，这是「打开管理面板」的跳转入口，不是登录凭证。
-            adminUrl: "http://127.0.0.1:8790/"
-            rules:
-              - qoder2api-hub
             concurrency: 4
             sessionHoldMs: 60000
-            # 2026-11-08 二段修复：规则层默认上游超时 120s（lib/proxy.mjs:33
-            # UPSTREAM_TIMEOUT_MS），而 intl 团队账号排队 10605 的等待/重开可达数分钟
-            # （ttft_p90 实测 114s，网关 QUEUE_WAIT_BUDGET_SECS 默认 600s）。120s 会在
-            # 网关把最终「上游排队中」错误帧发出来之前掐断流，客户端只看到
-            # 「upstream stream aborted during thinking」。这里放宽到 5 分钟，并配合
-            # 下方 launch.env 把网关排队预算收敛到 180s，让错误能明确落到客户端。
-            timeoutMs: 300000
+            # 模型清单：新桥 DefaultModelMap 的 13 个 display-name（models/models.go:33-47）。
+            # /v1/models 会在有账号后动态合并上游目录；这里声明这 13 个作静态回显示项。
+            # 全部不声明 reasoningEfforts -> patch-reasoning 里进 FORBIDDEN（efforts 是否可用随上游）。
+            models:
+              - id: Qwen3.8-Max
+                contextWindow: 128000
+              - id: Qwen3.8-Flash
+                contextWindow: 128000
+              - id: Qwen3.7-Max
+                contextWindow: 128000
+              - id: Qwen3.7-Plus
+                contextWindow: 128000
+              - id: Qwen3.7-Flash
+                contextWindow: 128000
+              - id: DeepSeek-V4-Pro
+                contextWindow: 128000
+              - id: DeepSeek-Flash
+                contextWindow: 128000
+              - id: GLM-5.3
+                contextWindow: 128000
+              - id: GLM-5.3-Flash
+                contextWindow: 128000
+              - id: GLM-5.2
+                contextWindow: 128000
+              - id: Kimi-K3
+                contextWindow: 128000
+              - id: Kimi-K2.8-Preview
+                contextWindow: 128000
+              - id: MiniMax-M2.7
+                contextWindow: 128000
+
+
+          # trae2api-hub（XCool-603/trae2api，Go 实现的 Trae CN 桥，vendor/trae2api/）：
+          # 与已卸载的 shuishuipingan/trae2api-hub（Python，:8791）完全不同的新实现。
+          # 零依赖 Go 单文件，launch.mjs 首次跑现场编译；CN 账号从本机 Trae 客户端凭据自动导入。
+          # NO rules —— 规则层是旧 Python hub 的，不匹配新桥。
+          - id: trae2api-hub
+            upstream: http://127.0.0.1:7870/v1
+            apiKey: "sk-trae-local"
+            adminUrl: http://127.0.0.1:7870/
+            label: Trae
             launch:
-              # 用系统 Python 跑内嵌源码副本里的 qoder_proxy.py（纯标准库，无需 venv）。
-              command: "C:\\Program Files\\Python311\\python.exe"
+              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
               args:
-                - "qoder_proxy.py"
-                - "--host"
-                - "127.0.0.1"
-                - "--port"
-                - "8790"
-                - "--api-key"
-                - "sk-qoder-local"
-                - "--panel-password"
-                - "sk-qoder-local"
-              # accounts/ / usage/ / 日志按 process.cwd()（=vendor 副本根）解析，必须指到内嵌副本根。
-              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-hub"
-              # 2026-11-08 修复（二段）：国际版上游（api3/api2/api1.qoder.sh、openapi.qoder.sh）
-              # 从国内直连常年 10s+ 建连后超时断联（实测 chat POST 40s 无响应 HTTP=000），
-              # TCP/TLS 层能通、真正的 POST 被出口 IP 卡死。修复：上游流量走本机 xray
-              # 混合代理 127.0.0.1:10808（HTTP CONNECT 与 SOCKS5 同端口，实测经代理 0.6s
-              # 即达）；cn 域名用 NO_PROXY 旁路保持直连（0.02s，xray 挂了也不受影响）。
-              # 网关两条请求路径都吃这套 env：qoder_accounts._opener_for_request() 每请求
-              # 现读 env；主聊天路径的裸 urlopen（默认 opener）也在首次使用时读 env，且
-              # ProxyHandler 每请求调 proxy_bypass()（NO_PROXY 生效，已实测验证）。
-              # 默认区域恢复 intl（用户面板原选择；intl 上游经代理可达后不再需要躲 cn）。
+                - "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\trae2api\\launch.mjs"
+                - "-listen"
+                - "127.0.0.1:7870"
+              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\trae2api"
               env:
-                QD_PROXY_DEFAULT_REALM: "intl"
                 HTTPS_PROXY: "http://127.0.0.1:10808"
                 HTTP_PROXY: "http://127.0.0.1:10808"
-                NO_PROXY: "localhost,127.0.0.1,.qoder.com.cn"
-                # 用户实际持有的套餐区域：国际版独占（Sonus 等）+ 双区模型只充国际版套餐。
-                # issue #89：非此集合的区域禁止自动换区 / 排队耗尽 failover（避免白烧国服慢镜像预算）。
-                # 2026-11-08：国际版修复后开放「国内国际互用」——intl 与 cn 都可作为换区 / 兜底目标。
-                QD_USABLE_REALMS: "intl,cn"
-                # 把排队等待预算从默认 600s 收敛到 90s：超预算网关发明确的
-                # {"error":{"type":"upstream_queued","code":503}} 帧，而不是让客户端空等
-                # 数分钟（配合本路由 timeoutMs=300000，规则层不会先掐断）。
-                QD_QUEUE_WAIT_BUDGET_SECS: "90"
-              # /health 在站点根，不在 upstream 之后，所以用 readyUrl。
-              readyUrl: "http://127.0.0.1:8790/health"
+                NO_PROXY: "localhost,127.0.0.1"
+              # /portal/status 无鉴权探针；桥登录上游靠客户端凭据，这里只确认网关起来。
+              readyUrl: "http://127.0.0.1:7870/portal/status"
               readyTimeoutMs: 60000
               readyPollMs: 1000
               killOnStop: true
-            # 模型清单（取自 vendor/qoder2api-hub/qoder_catalog_cn.json 国服目录：id=display_name、
-            # contextWindow=max_input_tokens、maxTokens 同 max_input_tokens——网关自己管真实输出上限���。
-            # is_vl=true 才标 input:[text,image]（国服只有 MiniMax-M2.7 不可看图）。
-            # 上游那 3 个 type=image 的生图模型不涉及；国服/国际两套目录的模型名不完全相同，
-            # 这里按国服目录声明（本机 Qoder 客户端是国服 com.qodercn.app.stable）。
-            # 模型选择器里显示哪些由下面 llm-pi-ai 那段决定，增删模型时两处必须一起改。
-            models:
-              - id: Auto
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-                  - image
-              - id: Cantus
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: DeepSeek-Flash
-                contextWindow: 1000000
-                maxTokens: 1000000
-                input:
-                  - text
-                  - image
-              - id: DeepSeek-V4-Pro
-                contextWindow: 1000000
-                maxTokens: 1000000
-                input:
-                  - text
-                  - image
-              - id: Efficient
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-                  - image
-              - id: Fast
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-                  - image
-              - id: GLM-5.3
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: GLM-5.3-Flash
-                contextWindow: 1000000
-                maxTokens: 1000000
-                input:
-                  - text
-                  - image
-              - id: Kimi-K2.8-Preview
-                contextWindow: 200000
-                maxTokens: 200000
-                input:
-                  - text
-                  - image
-              - id: Kimi-K3.1-Pro
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: MiniMax-M3.1-Flash
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: QoDuck
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Qwen3.8-Flash
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Qwen3.8-Max
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Sonus
-                contextWindow: 180000
-                maxTokens: 180000
-                input:
-                  - text
-                  - image
-              - id: Ultimate
-                contextWindow: 1000000
-                maxTokens: 1000000
-                input:
-                  - text
-                  - image
-# ---------------------------------------------------------------------------
-# DSH 侧的 provider 注册 —— 与上面同一个插件，跟随插件一起安装。
-#
-# 上面那段只提供 8788 上的规则层；下面这段把同一批 API 注册进 llm-pi-ai，
-# 模型选择器里才会直接出现 codearts / officeace。这样换机器时只要装本插件，
-# 就不必再手工改 profile 的 cordis.patch.yml。
-#
-# apiKeyEnv: API_RULES_BEARER —— 这是一条**占位** bearer（不是秘密）：pi-ai 只
-# 用它确认「引用已配置」，真正的上游鉴权由本插件按路由注入。插件装载时会经
-# lib/seed.mjs 自举写入这条引用（**只在缺失时写**，已有的值不动），所以新机器
-# 装完插件就能直接用，不必手工编辑 .credentials.yaml。
-#
-# 补丁语义（见 dsh-base/cordis.patch.yml 头注释）：补丁按 id 定位整行、
-# 「整块替换 config」而非深合并，后一层覆盖前一层。本插件在 bundles 里排在
-# dsh-base 之后，所以这里改得到 llm-pi-ai；但用户 profile 的 cordis.patch.yml
-# 又在所有 bundle 之后 —— 若某台机器的 profile 里已经有 `- id: llm-pi-ai`
-# 并且写了 providers，则以 profile 那份为准，需要把下面两条 provider 也补进
-# profile（本机 profile 已包含）。
-# ---------------------------------------------------------------------------
+            concurrency: 4
+            sessionHoldMs: 60000
+            timeoutMs: 300000
 - id: llm-pi-ai
   name: '@deepseek-ai/dsh-llm-pi-ai'
   config:
@@ -1346,210 +1113,6 @@
               xhigh: xhigh
               max: max
 
-      # Qoder（qoder2api-hub）：baseURL 指向本插件 8788 上的 /qoder2api-hub/v1 路由，
-      # 该路由在插件启动时自动拉起内嵌的 vendor/qoder2api-hub（默认 :8790）。
-      #
-      # 这里是**模型选择器显示哪些模型**的唯一来源：llm-pi-ai 不会向上游查询清单，
-      # 只展示这段里声明过的条目。与上面 qoder2api-hub 路由的 models 保持一致（增删两处一起改）。
-      # input: [text, image] 标记视觉模型，DSH 才会在 UI 上给出「发图」入口并真正送图。
-      # reasoningEfforts 取自 qoder_catalog_cn.json 逐模型的 thinking_config.enabled.efforts
-      # （Auto / Qwen3.7-* / MiniMax-M2.7 上游未给思考档位，不声明；网关会按模型归一档位）。
-      qoder2api-hub:
-        # 模型选择器里这个 provider 的**显示名**；map key 本身是功能路由键，不能改。
-        displayName: Qoder
-        apiKeyEnv: API_RULES_BEARER
-        api: openai-completions
-        baseURL: http://127.0.0.1:8788/qoder2api-hub/v1
-        models:
-          - id: Auto
-            name: Auto
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Cantus
-            name: Cantus
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: DeepSeek-Flash
-            name: DeepSeek-Flash
-            contextWindow: 1000000
-            maxTokens: 1000000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              high: high
-              max: max
-          - id: DeepSeek-V4-Pro
-            name: DeepSeek-V4-Pro
-            contextWindow: 1000000
-            maxTokens: 1000000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              high: high
-              max: max
-          - id: Efficient
-            name: Efficient
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Fast
-            name: Fast
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: GLM-5.3
-            name: GLM-5.3
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              high: high
-              max: max
-          - id: GLM-5.3-Flash
-            name: GLM-5.3-Flash
-            contextWindow: 1000000
-            maxTokens: 1000000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              high: high
-              max: max
-          - id: Kimi-K2.8-Preview
-            name: Kimi-K2.8-Preview
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              high: high
-              max: max
-          - id: Kimi-K3.1-Pro
-            name: Kimi-K3.1-Pro
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              high: high
-              max: max
-          - id: MiniMax-M3.1-Flash
-            name: MiniMax-M3.1-Flash
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: QoDuck
-            name: QoDuck
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              high: high
-              xhigh: xhigh
-          - id: Qwen3.8-Flash
-            name: Qwen3.8-Flash
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              xhigh: xhigh
-          - id: Qwen3.8-Max
-            name: Qwen3.8-Max
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              xhigh: xhigh
-          - id: Sonus
-            name: Sonus
-            contextWindow: 180000
-            maxTokens: 180000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Ultimate
-            name: Ultimate
-            contextWindow: 1000000
-            maxTokens: 1000000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-
       # MiniMax（minimax2api）：与上面 minimax2api 路由一一对应。
       # 网关把 thinking 当布尔开关，规则层（minimax2api.mjs）把 DSH 的 reasoning_effort
       # 档位翻译成 thinking true/false；m3.1-flash 思考强制开、m3 可开关。
@@ -1592,228 +1155,85 @@
               high: high
               xhigh: xhigh
               max: max
-      # Trae（trae2api-hub）：baseURL 指向本插件 8788 上的 /trae2api-hub/v1 路由，
-      # 该路由在插件启动时自动拉起内嵌的 vendor/trae2api-hub（默认 :8791）。
-      # 只展示这段里声明过的条目。与上面 trae2api-hub 路由的 models 保持一致（增删两处一起改）。
-      trae2api-hub:
-        displayName: Trae
-        apiKeyEnv: API_RULES_BEARER
-        api: openai-completions
-        baseURL: "http://127.0.0.1:8788/trae2api-hub/v1"
-        models:
-          - id: Seed-Code
-            name: Seed-Code
-            contextWindow: 256000
-            maxTokens: 256000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Kimi-K3
-            name: Kimi-K3
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: DeepSeek-V4-Flash
-            name: DeepSeek-V4-Flash
-            contextWindow: 116000
-            maxTokens: 116000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: DeepSeek-V4-Pro
-            name: DeepSeek-V4-Pro
-            contextWindow: 116000
-            maxTokens: 116000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: GLM-5.3
-            name: GLM-5.3
-            contextWindow: 116000
-            maxTokens: 116000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Qwen3.8-Max
-            name: Qwen3.8-Max
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Kimi-K2.8-Preview
-            name: Kimi-K2.8-Preview
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: MiniMax-M3
-            name: MiniMax-M3
-            contextWindow: 116000
-            maxTokens: 116000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Seed-2.1-Pro-0915
-            name: Seed-2.1-Pro-0915
-            contextWindow: 256000
-            maxTokens: 256000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: DeepSeek-V3.1-Terminus
-            name: DeepSeek-V3.1-Terminus
-            contextWindow: 136192
-            maxTokens: 136192
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Claude-Opus-4.7
-            name: Claude-Opus-4.7
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Claude-Sonnet-4.6
-            name: Claude-Sonnet-4.6
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: GPT-5.5
-            name: GPT-5.5
-            contextWindow: 272000
-            maxTokens: 272000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: GPT-6-Astra
-            name: GPT-6-Astra
-            contextWindow: 272000
-            maxTokens: 272000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Gemini-2.5-Pro
-            name: Gemini-2.5-Pro
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Gemini-3.1-Pro-Preview
-            name: Gemini-3.1-Pro-Preview
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Grok-4
-            name: Grok-4
-            contextWindow: 128000
-            maxTokens: 128000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: Kimi-K2-0905
-            name: Kimi-K2-0905
-            contextWindow: 200000
-            maxTokens: 200000
-            input:
-              - text
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
+
+        qoder2api-hub:
+          displayName: Qoder
+          # EchoPing07/Qoder-2API-Go（vendor/qoder2api-go/）单端口 :10081。DefaultModelMap 的 13 个
+          # display-name（models/models.go:33-47）。/v1/models 有账号后动态合并上游目录，这里声明静态项。
+          # 全部不声明 reasoningEfforts -> patch-reasoning FORBIDDEN（efforts 是否可用随上游）。
+          models:
+            - id: Qwen3.8-Max
+              contextWindow: 128000
+            - id: Qwen3.8-Flash
+              contextWindow: 128000
+            - id: Qwen3.7-Max
+              contextWindow: 128000
+            - id: Qwen3.7-Plus
+              contextWindow: 128000
+            - id: Qwen3.7-Flash
+              contextWindow: 128000
+            - id: DeepSeek-V4-Pro
+              contextWindow: 128000
+            - id: DeepSeek-Flash
+              contextWindow: 128000
+            - id: GLM-5.3
+              contextWindow: 128000
+            - id: GLM-5.3-Flash
+              contextWindow: 128000
+            - id: GLM-5.2
+              contextWindow: 128000
+            - id: Kimi-K3
+              contextWindow: 128000
+            - id: Kimi-K2.8-Preview
+              contextWindow: 128000
+            - id: MiniMax-M2.7
+              contextWindow: 128000
+
+
+        trae2api-hub:
+          displayName: Trae
+          # XCool-603/trae2api（Go 实现的 Trae CN 桥，vendor/trae2api/）。
+          # 20 个 trae: CN 模型实测来自 /v1/models（CN 账号有效池，token 至 2026-11-18）。
+          # 这些模型上游都不下发 reasoning_efforts → 全部进 patch-reasoning FORBIDDEN（无思考配置）。
+          # max_tokens 上游回 0（未下发）→ 不设 maxTokens，交 DSH 用默认。
+          models:
+            - id: trae:DeepSeek-V4-Flash-Official
+              contextWindow: 116000
+            - id: trae:DeepSeek-V4-Pro-Official
+              contextWindow: 116000
+            - id: trae:Doubao-Seed-2.1-Pro
+              contextWindow: 128000
+            - id: trae:Doubao-Seed-2.1-Turbo
+              contextWindow: 128000
+            - id: trae:Doubao-Seed-Code
+              contextWindow: 128000
+            - id: trae:Doubao-Seed-Evolving
+              contextWindow: 128000
+            - id: trae:deepseek-v4.1-flash
+              contextWindow: 128000
+            - id: trae:glm-5.2
+              contextWindow: 128000
+            - id: trae:glm-5.3
+              contextWindow: 128000
+            - id: trae:glm-5.3-flash
+              contextWindow: 128000
+            - id: trae:glm-5.3-flashx
+              contextWindow: 128000
+            - id: trae:kimi-k2.8-preview
+              contextWindow: 200000
+            - id: trae:kimi-k3
+              contextWindow: 200000
+            - id: trae:mimo-v2.6-flash
+              contextWindow: 128000
+            - id: trae:mimo-v2.6-pro
+              contextWindow: 128000
+            - id: trae:minimax-m3
+              contextWindow: 128000
+            - id: trae:qwen-3.7-plus
+              contextWindow: 128000
+            - id: trae:qwen3.8-flash
+              contextWindow: 128000
+            - id: trae:qwen3.8-max
+              contextWindow: 128000
+            - id: trae:step-5-preview
+              contextWindow: 128000

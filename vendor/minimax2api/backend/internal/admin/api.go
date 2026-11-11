@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -129,6 +130,12 @@ const sessionKey ctxKey = "session"
 
 func (a *API) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 本地单机面板鉴权开关：默认关闭管理员登录界面。
+		// 设 MINIMAX2API_DISABLE_AUTH=0 可恢复登录鉴权。
+		if os.Getenv("MINIMAX2API_DISABLE_AUTH") != "0" {
+			next(w, r)
+			return
+		}
 		token := bearer(r)
 		if token == "" || !a.store.ValidateSession(token) {
 			writeError(w, http.StatusUnauthorized, "登录已过期，请重新登录")

@@ -1,195 +1,195 @@
 {
-  "lastProbeAt": 1793728700202,
+  "lastProbeAt": 1794355865341,
   "probedWithCredentials": "01a1496da354727da118d3a038300ab7:01a1496da35476d28e89adf188becc5a",
   "unavailable": [
-    "deepseek-v4-pro",
     "deepseek-v4.1-flash-bnt",
-    "deepseek-v4.1-flash-qianfan",
     "glm-5.2-a3",
-    "glm-5.2-harmony",
-    "glm-5.3-test",
+    "deepseek-v4-pro",
     "glm.5.2-arkts-spark",
+    "glm-5.3-test",
+    "deepseek-v4.1-flash-qianfan",
     "kimi-k3-1019",
     "kimi-k3-test-1009",
+    "glm-5.2-harmony",
     "kimi-k3.1-pro",
-    "openpangu-2.0-flash",
-    "openpangu-2.0-pro"
+    "openpangu-2.0-pro",
+    "openpangu-2.0-flash"
   ],
   "results": {
     "deepseek-v4-pro": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728686202,
-      "ms": 129
+      "at": 1794355865148,
+      "ms": 124
     },
     "deepseek-v4.1-flash": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728686661,
-      "ms": 588
+      "at": 1793855463565,
+      "ms": 1469
     },
     "deepseek-v4.1-flash-0930": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728686677,
-      "ms": 475
+      "at": 1793855463555,
+      "ms": 1060
     },
     "deepseek-v4.1-flash-bnt": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728686747,
-      "ms": 70
+      "at": 1794355865144,
+      "ms": 119
     },
     "deepseek-v4.1-flash-qianfan": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728686811,
-      "ms": 64
+      "at": 1794355865249,
+      "ms": 224
     },
     "deepseek-v4.1-flash-1017": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728687260,
-      "ms": 599
+      "at": 1793855464341,
+      "ms": 924
     },
     "deepseek-v4-flash-0731": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728687461,
-      "ms": 1389
+      "at": 1793855463417,
+      "ms": 1322
     },
     "glm-5.2-a3": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728687519,
-      "ms": 58
+      "at": 1794355865147,
+      "ms": 122
     },
     "glm-5.2-harmony": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728687582,
-      "ms": 62
+      "at": 1794355865285,
+      "ms": 141
     },
     "glm-5.3": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728688513,
-      "ms": 931
+      "at": 1793855465712,
+      "ms": 1062
     },
     "deepseek-v4-flash": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728688631,
-      "ms": 2561
+      "at": 1793855465118,
+      "ms": 3023
     },
     "glm-5.3-test": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728688696,
+      "at": 1794355865212,
       "ms": 65
     },
     "glm.5.2-arkts-spark": {
       "ok": false,
       "status": 403,
       "code": "ModelArts.81004",
-      "at": 1793728688758,
-      "ms": 62
+      "at": 1794355865206,
+      "ms": 58
     },
     "glm-5.3-flash": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728689490,
-      "ms": 976
+      "at": 1793855466484,
+      "ms": 1366
     },
     "kimi-k3": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728691523,
-      "ms": 2033
+      "at": 1793855467896,
+      "ms": 1412
     },
     "kimi-k3-1019": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728691583,
-      "ms": 60
+      "at": 1794355865265,
+      "ms": 59
     },
     "kimi-k3-test-1009": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728691643,
-      "ms": 60
+      "at": 1794355865275,
+      "ms": 63
     },
     "kimi-k3.1-pro": {
       "ok": false,
       "status": 404,
       "code": "ModelArts.81009",
-      "at": 1793728691699,
-      "ms": 56
+      "at": 1794355865308,
+      "ms": 59
     },
     "openpangu-2.0-flash": {
       "ok": false,
       "status": 403,
       "code": "ModelArts.81004",
-      "at": 1793728691764,
-      "ms": 65
+      "at": 1794355865341,
+      "ms": 76
     },
     "openpangu-2.0-pro": {
       "ok": false,
       "status": 403,
       "code": "ModelArts.81004",
-      "at": 1793728691820,
-      "ms": 56
+      "at": 1794355865333,
+      "ms": 58
     },
     "qwen3-30b-a3b": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728692014,
-      "ms": 194
+      "at": 1793855469344,
+      "ms": 302
     },
     "qwen3-32b": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728692249,
-      "ms": 235
+      "at": 1793855469822,
+      "ms": 478
     },
     "glm-5.2": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728696138,
-      "ms": 8878
+      "at": 1793855477839,
+      "ms": 14116
     },
     "kimi-k2.6": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728696818,
-      "ms": 8060
+      "at": 1793855473943,
+      "ms": 7894
     },
     "glm-5.1": {
       "ok": true,
       "status": 200,
       "code": "",
-      "at": 1793728700202,
-      "ms": 13391
+      "at": 1793855476733,
+      "ms": 13018
     }
   }
 }

@@ -408,6 +408,10 @@ type State struct {
 	Audits     []*Audit        `json:"audits"`
 	Media      []*MediaItem    `json:"media"`
 	Models     []*ModelConfig  `json:"models"`
+	// Sessions is the persisted admin-panel session map (token -> expiry). It is
+	// kept here so a gateway restart does not force the operator to re-enter the
+	// panel password; issue/revoke mirror the in-memory map into this field.
+	Sessions map[string]time.Time `json:"sessions,omitempty"`
 }
 
 // BuiltinModels is the model catalogue exposed through /v1/models.

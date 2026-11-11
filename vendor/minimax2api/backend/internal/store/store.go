@@ -30,7 +30,9 @@ var (
 const (
 	stateFile     = "app.json"
 	pbkdfRounds   = 120000
-	sessionTTL    = 12 * time.Hour
+	// Local single-operator panel: a month-long session reads as "remember me"
+	// so the operator is not re-prompted after every gateway restart.
+	sessionTTL    = 30 * 24 * time.Hour
 	maxSessions   = 512
 	schemaVersion = 1
 )
@@ -115,6 +117,19 @@ func Open(dataDir, adminUser, adminPassword string) (*Store, error) {
 
 	if fresh {
 		store.state.Settings = config.DefaultSettings(dataDir)
+	}
+	// Sessions ride on the persisted state so an admin login survives a gateway
+	// restart: share the in-memory map with the state field the background
+	// writer already serialises, seeding it with whatever the last run wrote.
+	// Expired tokens are dropped on load; live ones stay valid after a restart.
+	if store.state.Sessions == nil {
+		store.state.Sessions = make(map[string]time.Time)
+	}
+	store.sessions = store.state.Sessions
+	for token, at := range store.sessions {
+		if time.Now().After(at) {
+			delete(store.sessions, token)
+		}
 	}
 	store.state.Version = schemaVersion
 	// A repair has to be written back, not just applied in memory: leaving the
@@ -423,6 +438,10 @@ func (s *Store) IssueSession() (string, time.Time) {
 		}
 	}
 	s.sessions[token] = expires
+	// Mirror into the persisted state and queue a write so the login survives a
+	// restart; markDirtyLocked must run under the write lock.
+	s.state.Sessions = s.sessions
+	s.markDirtyLocked()
 	s.mu.Unlock()
 	return token, expires
 }
@@ -446,6 +465,8 @@ func (s *Store) ValidateSession(token string) bool {
 	s.mu.Lock()
 	if at, still := s.sessions[token]; still && time.Now().After(at) {
 		delete(s.sessions, token)
+		s.state.Sessions = s.sessions
+		s.markDirtyLocked()
 	}
 	s.mu.Unlock()
 	return false
@@ -454,6 +475,8 @@ func (s *Store) ValidateSession(token string) bool {
 func (s *Store) RevokeSession(token string) {
 	s.mu.Lock()
 	delete(s.sessions, token)
+	s.state.Sessions = s.sessions
+	s.markDirtyLocked()
 	s.mu.Unlock()
 }
 

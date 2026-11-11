@@ -14,6 +14,16 @@
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#070707" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>MiniMax2API</title>
+    <script>
+      // 本地单机面板：跳过管理员登录界面（后端 MINIMAX2API_DISABLE_AUTH 已放行）。
+      // 前端只在 localStorage 已有令牌时才会去探测 /auth/me，因此这里种一个占位令牌，
+      // 让控制台直接进入管理台。恢复登录鉴权（DISABLE_AUTH=0）时，后端返回 401 会自动清除并重定向到 /login。
+      try {
+        if (!localStorage.getItem('minimax2api:admin-token')) {
+          localStorage.setItem('minimax2api:admin-token', 'local-auto');
+        }
+      } catch (e) {}
+    </script>
     <script type="module" crossorigin src="/assets/index-D38I_ANw.js"></script>
     <link rel="stylesheet" crossorigin href="/assets/index-ZpHn3Lv2.css">
   </head>

@@ -617,5 +617,107 @@ function cleanTool(name) {
   }
 }
 
+
+// —————————————————————————————————————————————————————————————————————————————
+// DSML 草稿（spark-x2.6 另一种工具调用格式退化）——回归，2026-11-10 补
+// 与上面的旧式 XML 草稿是同一故障类，只是标记换成全角竖线 <｜｜DSML｜｜ …>：
+//   <｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name="…"> <｜｜DSML｜｜ parameter …> </｜｜DSML｜｜ invoke> …
+// 取证：session-e4c90717 的 assistant/message 正文 text 块（L397/L628/L905/L929/L954/L1004）。
+// —————————————————————————————————————————————————————————————————————————————
+{
+  const NL3 = String.fromCharCode(10)
+  const sse3 = (frames) => frames.map((f) => 'data: ' + f + NL3 + NL3).join('')
+  const realFetch3 = globalThis.fetch
+  const delta = (obj) => JSON.stringify({ choices: [{ index: 0, delta: obj }] })
+  const finish = (reason) => JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: reason }] })
+
+  async function runDraftStream(framesPerCall, clientBody) {
+    const { createProxy } = await import('../lib/proxy.mjs')
+    const { RuleRegistry } = await import('../lib/registry.mjs')
+    const registry = new RuleRegistry()
+    registry.register(loomyRules)
+    const calls = []
+    let callIndex = 0
+    globalThis.fetch = async (url, init) => {
+      const body = JSON.parse(String(init.body))
+      calls.push(body)
+      const frames = framesPerCall[Math.min(callIndex, framesPerCall.length - 1)]
+      callIndex += 1
+      return new Response(sse3(frames), { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } })
+    }
+    let proxy
+    try {
+      proxy = createProxy({ port: 0, autoLaunch: false, registry, routes: [{ id: 'loomy2api', upstream: 'http://127.0.0.1:17890/v1', apiKey: 'sk-loomy-local', rules: ['loomy2api'], timeoutMs: 3600000 }] })
+      await proxy.ready
+      const res = await realFetch3(proxy.origin() + '/loomy2api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer sk-loomy-local', 'Content-Type': 'application/json' },
+        body: JSON.stringify(clientBody),
+      })
+      return { out: await res.text(), calls }
+    } finally {
+      globalThis.fetch = realFetch3
+      if (proxy) { try { await Promise.race([proxy.close(), new Promise((r) => setTimeout(r, 1500))]) } catch {} }
+    }
+  }
+
+  const originalMessages = [{ role: 'user', content: '读一下 qoder.mjs' }]
+  const clientBody = { model: 'spark-x2.6', stream: true, messages: originalMessages }
+
+  // 用户 2026-11-10 反馈的原样样本形态（含全角竖线 U+FF5C）
+  const dsmlLeak =
+    '<｜｜DSML｜｜ calls>' +
+    '<｜｜DSML｜｜ invoke name="ops_read_files">' +
+    '<｜｜DSML｜｜ parameter name="files" string="false">[{"path":"D:\\DSH Workspace\\x.md","offset":130,"limit":17}]</｜｜DSML｜｜ parameter>' +
+    '</｜｜DSML｜｜ invoke>' +
+    '</｜｜DSML｜｜ calls>'
+  const oldXmlLeak = '<ops_bash<arg_key>command</arg_key><arg_value>cat qoder.mjs</arg_value></tool_call>'
+  const meta = (over) => ({ sawContent: true, sawToolCall: false, sawFinishReason: true, sentAnything: true, contentText: dsmlLeak, ...over })
+
+  const dsmlFrames = [ delta({ content: dsmlLeak }), finish("stop"), "[DONE]" ]
+  const cleanFrames = [ delta({ content: "好的，这是文件内容。" }), finish("stop"), "[DONE]" ]
+  const toolCallFrame = JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "ops_read_files", arguments: "{}" } }] }, finish_reason: "tool_calls" }] })
+  const toolFrames = [ toolCallFrame, "[DONE]" ]
+
+  const ok = (n, c) => check("[DSML 草稿] " + n, c === true)
+  const eq = (n, a, b) => equal("[DSML 草稿] " + n, a, b)
+
+  // —— 单元：命中 / 不命中边界 ——
+  ok('真实 DSML 样本命中', loomyRules.isIncompleteTurn('spark-x2.6', meta()) === true)
+  ok('旧式 XML 草稿仍命中（不回归）', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: oldXmlLeak })) === true)
+  ok('ASCII 竖线变体也命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: dsmlLeak.replace(/｜/g, '|') })) === true)
+  ok('正常回答不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: '好的，结果如下。' })) === false)
+  ok('单个 <｜｜DSML｜｜ parameter> 技术说明不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: '正文里提到 <｜｜DSML｜｜ parameter> 标记是正常的说明。' })) === false)
+  ok('代码围栏里的 DSML 示例不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: '示例：```\n' + dsmlLeak + '\n```\n以上演示。' })) === false)
+  ok('旧式1类 + DSML1类 混合不凑数（避免误伤）', loomyRules.isIncompleteTurn('spark-x2.6', meta({ contentText: '关于 <arg_key> 字段，以及 <｜｜DSML｜｜ invoke> 这种格式……' })) === false)
+  ok('无 finish_reason 不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ sawFinishReason: false })) === false)
+  ok('有结构化 tool_calls 不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ sawToolCall: true })) === false)
+  ok('无正文不命中', loomyRules.isIncompleteTurn('spark-x2.6', meta({ sawContent: false, contentText: '' })) === false)
+
+  // —— 单元：纠正消息同时点名两种格式 ——
+  ok('纠正指令点名 DSML', loomyRules.incompleteTurnMessages(originalMessages, dsmlLeak)[2].content.includes('DSML'))
+  ok('纠正指令仍点名 tool_calls', loomyRules.incompleteTurnMessages(originalMessages, dsmlLeak)[2].content.includes('tool_calls'))
+
+  // —— E2E：DSML 草稿流触发且仅触发 1 次续推 ——
+  try {
+    const r = await runDraftStream([dsmlFrames, cleanFrames], clientBody)
+    eq('DSML 草稿触发且仅 1 次续推（共 2 次请求）', r.calls.length, 2)
+    eq('续推 messages 长度', r.calls[1].messages.length, originalMessages.length + 2)
+    ok('续推 assistant 回合原样保留 DSML 草稿', r.calls[1].messages[1].content === dsmlLeak)
+    ok('续推 user 纠正指令含 DSML', r.calls[1].messages[2].content.includes('DSML'))
+    ok('最终输出为纠正后正常正文', r.out.includes('好的，这是文件内容。'))
+  } catch (error) {
+    ok('DSML E2E 无异常', false, String((error && error.stack) || error))
+  }
+
+  // —— E2E：正常回答 / 结构化 tool_calls 不续推（负向）——
+  try {
+    eq('正常回答不续推（仅 1 次请求）', (await runDraftStream([cleanFrames, cleanFrames], clientBody)).calls.length, 1)
+    eq('结构化 tool_calls 不续推（仅 1 次请求）', (await runDraftStream([toolFrames, cleanFrames], clientBody)).calls.length, 1)
+  } catch (error) {
+    ok('负向 E2E 无异常', false, String((error && error.stack) || error))
+  }
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed')
 process.exit(failures === 0 ? 0 : 1)

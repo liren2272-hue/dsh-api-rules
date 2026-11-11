@@ -154,9 +154,19 @@ func (a *API) pollBrowserLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The operator's phone is the strongest signal (a +86 number is a mainland
+	// account even if the global site issued the token), but the mainland
+	// deployment does not always report it back — an account without a phone, or
+	// whose phone arrives without the country code, would otherwise be misfiled
+	// as global and routed to the wrong upstream. The origin that produced the
+	// token is the next-best signal, so fall back to it before giving up.
+	region := regionFromPhone(info.Phone)
+	if region == "" {
+		region = regionFromTokenOrigin(status.Host)
+	}
 	account, err := buildAccount(accountPayload{
 		Token:  status.Token,
-		Region: regionFromPhone(info.Phone),
+		Region: region,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "登录成功但令牌无效："+err.Error())
@@ -213,8 +223,33 @@ func regionFromPhone(phone string) string {
 	if strings.HasPrefix(digits, "86") {
 		return store.RegionCN
 	}
-	// No phone, or a non-mainland country code: let buildAccount fall back to the
-	// token's own hint, then the global default.
+	// No phone, or a non-mainland country code: no deployment hint from the
+	// phone. buildAccount falls back to the token's own hint, then the global
+	// default.
+	return ""
+}
+
+// regionFromTokenOrigin maps the agent-site origin a token was minted on to a
+// deployment region. The two deployments are separate products with separate
+// account databases, so the origin that issued the token is the authoritative
+// routing target when the upstream reports no phone. Accepts either a full URL
+// or a bare hostname; returns "" when it matches neither deployment.
+func regionFromTokenOrigin(origin string) string {
+	trimmed := strings.TrimSpace(origin)
+	if trimmed == "" {
+		return ""
+	}
+	host := trimmed
+	if parsed, err := url.Parse(trimmed); err == nil && parsed.Hostname() != "" {
+		host = parsed.Hostname()
+	}
+	host = strings.ToLower(host)
+	if strings.Contains(host, "minimaxi.com") || strings.Contains(host, "minimax.cn") {
+		return store.RegionCN
+	}
+	if strings.Contains(host, "minimax.io") {
+		return store.RegionGlobal
+	}
 	return ""
 }
 

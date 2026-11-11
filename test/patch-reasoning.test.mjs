@@ -48,14 +48,10 @@ const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhi
 //     （raccoon2api 插件归一化：off/none/minimal -> low；GLM/Kimi 的 medium -> high）
 const EXPECTED = new Map([
   // 2026-11-08 17:11 探针（tmp/probe-all-efforts.json）在 8788 上实测：
-  // qoder2api-hub 的 Auto / Efficient / Fast 五个档位返回 200（Auto 的 max 那次 400，
   // 其余档位 200），loomy2api 的 qwen-3.8-max / auto 也补了声明。这五条曾经在
   // FORBIDDEN 里（「无思考配置，不声明」），补声明后白名单必须同步，否则本测试会红。
   ['loomy2api/qwen-3.8-max', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['loomy2api/auto', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['qoder2api-hub/Auto', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['qoder2api-hub/Efficient', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['qoder2api-hub/Fast', ['low', 'medium', 'high', 'xhigh', 'max']],
   // 2026-11-09 minimax2api（MiniMax Agent 官方客户端网关，:8080）：
   // 它不认 OpenAI 的 reasoning_effort 档位，只认布尔 `thinking`；规则层
   // （lib/rules/minimax2api.mjs:112-118）把任何非 off/none/disabled/minimal 的档位
@@ -64,28 +60,7 @@ const EXPECTED = new Map([
   // 声明出来只是让选择器能列档，不会产生 400 —— 所以按五档声明。
   ['minimax2api/minimax-m3.1-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['minimax2api/minimax-m3', ['low', 'medium', 'high', 'xhigh', 'max']],
-  // 2026-11-09 trae2api-hub（:8791，trae_proxy.py:1.4.3）：
   // 网关原生处理 reasoning_effort（低/中/高/超高/最高五档直接透传给上游的
-  // parameters.reasoning_effort，见 trae_proxy.py:3812 normalize_reasoning_effort），
-  // 五档对 trae 模型全部合法、语义等价，声明出来让选择器能列档，不会产生 400。
-  ['trae2api-hub/Seed-Code', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Kimi-K3', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/DeepSeek-V4-Flash', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/DeepSeek-V4-Pro', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/GLM-5.3', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Qwen3.8-Max', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Kimi-K2.8-Preview', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/MiniMax-M3', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Seed-2.1-Pro-0915', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/DeepSeek-V3.1-Terminus', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Claude-Opus-4.7', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Claude-Sonnet-4.6', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/GPT-5.5', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/GPT-6-Astra', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Gemini-2.5-Pro', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Gemini-3.1-Pro-Preview', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Grok-4', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['trae2api-hub/Kimi-K2-0905', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['codearts/GLM-5.2', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['codearts/glm-5.3', ['low', 'high', 'max']],
   ['codearts/deepseek-v4.1-flash', ['low', 'medium', 'high', 'xhigh', 'max']],
@@ -122,22 +97,7 @@ const EXPECTED = new Map([
   ['loomy2api/GLM-5.3-Flash', ['low', 'medium', 'high', 'xhigh']],
   ['loomy2api/qwen3.8-flash', ['low', 'medium', 'high', 'xhigh']],
   ['loomy2api/mimo-v2.5', ['low', 'medium', 'high', 'xhigh']],
-  // qoder2api-hub：档位来自上游 /v1/models 实测（账号 intl realm，阵容动态，随账号/上游变化）。
-  // 网关自动把上游不支持的档位归一到最近合法档（qoder_proxy.py normalize_reasoning_effort:3751）。
   // Auto / Efficient / Fast 无思考配置，不声明 reasoningEfforts（选择器不出现档位菜单）。
-  ['qoder2api-hub/Ultimate', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['qoder2api-hub/Sonus', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['qoder2api-hub/Cantus', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['qoder2api-hub/MiniMax-M3.1-Flash', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['qoder2api-hub/Qwen3.8-Max', ['low', 'medium', 'xhigh']],
-  ['qoder2api-hub/Qwen3.8-Flash', ['low', 'medium', 'xhigh']],
-  ['qoder2api-hub/Kimi-K3.1-Pro', ['low', 'high', 'max']],
-  ['qoder2api-hub/Kimi-K2.8-Preview', ['low', 'high', 'max']],
-  ['qoder2api-hub/GLM-5.3', ['low', 'high', 'max']],
-  ['qoder2api-hub/GLM-5.3-Flash', ['high', 'max']],
-  ['qoder2api-hub/DeepSeek-V4-Pro', ['high', 'max']],
-  ['qoder2api-hub/DeepSeek-Flash', ['low', 'high', 'max']],
-  ['qoder2api-hub/QoDuck', ['low', 'high', 'xhigh']],
   ['cline/cline-free/nemotron-3.5-super-vl', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['cline/cline-free/solar-mini4', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['cline/nvidia/nemotron-3.5-lightning-free', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
@@ -163,6 +123,63 @@ const FORBIDDEN = [
   // switchable，见 lib/rules/minimax2api.mjs:29-38），thinking 入参对它无意义，
   // 所以 cordis.patch.yml 不给它声明 reasoningEfforts；列在这里把「故意不声明」固化下来。
   'minimax2api/minimax-agent',
+  // qoder2api-hub/<display-name>：换到 EchoPing07/Qoder-2API-Go 单端口桥（vendor/qoder2api-go/）。
+  // 13 个 display-name 模型（models/models.go DefaultModelMap）；bridge 对 reasoning_effort 是
+  // verbatim 透传、不过滤，具体某模型接不接受 efforts 由上游决定 -> 保守全部进 FORBIDDEN，
+  // 避免 UNSUPPORTED_REASONING_EFFORT。该路由 NO rules，选择器不出现档位菜单。
+  'qoder2api-hub/Qwen3.8-Max',
+  'qoder2api-hub/Qwen3.8-Flash',
+  'qoder2api-hub/Qwen3.7-Max',
+  'qoder2api-hub/Qwen3.7-Plus',
+  'qoder2api-hub/Qwen3.7-Flash',
+  'qoder2api-hub/DeepSeek-V4-Pro',
+  'qoder2api-hub/DeepSeek-Flash',
+  'qoder2api-hub/GLM-5.3',
+  'qoder2api-hub/GLM-5.3-Flash',
+  'qoder2api-hub/GLM-5.2',
+  'qoder2api-hub/Kimi-K3',
+  'qoder2api-hub/Kimi-K2.8-Preview',
+  'qoder2api-hub/MiniMax-M2.7',
+  // trae2api-hub/trae:DeepSeek-V4-Flash-Official：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:DeepSeek-V4-Flash-Official',
+  // trae2api-hub/trae:DeepSeek-V4-Pro-Official：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:DeepSeek-V4-Pro-Official',
+  // trae2api-hub/trae:Doubao-Seed-2.1-Pro：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:Doubao-Seed-2.1-Pro',
+  // trae2api-hub/trae:Doubao-Seed-2.1-Turbo：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:Doubao-Seed-2.1-Turbo',
+  // trae2api-hub/trae:Doubao-Seed-Code：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:Doubao-Seed-Code',
+  // trae2api-hub/trae:Doubao-Seed-Evolving：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:Doubao-Seed-Evolving',
+  // trae2api-hub/trae:deepseek-v4.1-flash：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:deepseek-v4.1-flash',
+  // trae2api-hub/trae:glm-5.2：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:glm-5.2',
+  // trae2api-hub/trae:glm-5.3：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:glm-5.3',
+  // trae2api-hub/trae:glm-5.3-flash：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:glm-5.3-flash',
+  // trae2api-hub/trae:glm-5.3-flashx：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:glm-5.3-flashx',
+  // trae2api-hub/trae:kimi-k2.8-preview：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:kimi-k2.8-preview',
+  // trae2api-hub/trae:kimi-k3：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:kimi-k3',
+  // trae2api-hub/trae:mimo-v2.6-flash：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:mimo-v2.6-flash',
+  // trae2api-hub/trae:mimo-v2.6-pro：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:mimo-v2.6-pro',
+  // trae2api-hub/trae:minimax-m3：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:minimax-m3',
+  // trae2api-hub/trae:qwen-3.7-plus：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:qwen-3.7-plus',
+  // trae2api-hub/trae:qwen3.8-flash：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:qwen3.8-flash',
+  // trae2api-hub/trae:qwen3.8-max：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:qwen3.8-max',
+  // trae2api-hub/trae:step-5-preview：Go 桥实测 /v1/models，上游不下发 reasoning_efforts → 无思考配置
+  'trae2api-hub/trae:step-5-preview',
 ]
 
 let failures = 0
