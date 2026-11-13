@@ -288,6 +288,15 @@
             # stream_idle_timeout（单次 read 无数据 120s 判死）+ 客户端断开信号承担，
             # 总时长上限只需宽松到不误杀合法长流即可。
             timeoutMs: 3600000
+            # 生图/生视频通道声明（goal-58ba6a2c）。这些 media 模型只认
+            # /v1/images|videos/generations，不进上面的 chat models 清单（打 chat 会 400）；
+            # 设置卡片的「生图 / 生视频」面板读这段决定展示哪个表单与模型下拉。
+            # loomy2api 实测只支持生图（/v1/videos/generations 返回「未知路径」）。
+            media:
+              images:
+                - Hy-Image-3.5-preview
+                - doubao-seedream-5-lite
+                - qwen-image-3.0-pro
             launch:
               # 用内嵌 .venv 的 python，不依赖用户全局 python 的版本/位置。
               command: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\loomy2api\\.venv\\Scripts\\python.exe"
@@ -385,6 +394,15 @@
             concurrency: 4
             sessionHoldMs: 60000
             timeoutMs: 300000
+            # 生图/生视频通道声明（goal-58ba6a2c）。minimax2api 生图+生视频都支持；
+            # 生图上游忽略 body.model 用固定 imageModel，生视频快档 H3 ~20s 返回 URL。
+            media:
+              images:
+                - minimax-image
+              videos:
+                - minimax-h3
+                - minimax-h3-max
+                - minimax-hailuo-2-3
             launch:
               # 经 node 启动器同时拉起「网关 + 浏览器登录 CDP bridge(:8766)」，
               # 使浏览器加账号随路由自启自停（此前只起 exe，bridge 丢失导致浏览器登录失效）。
@@ -434,74 +452,6 @@
                 input:
                   - text
                   - image
-          # qoder2api-hub（EchoPing07/Qoder-2API-Go，Go 重写 fengyinxia/qoder2api，vendor/qoder2api-go/）：
-          # 换掉旧 Zhengyuuuui 桥（UI 丑）。新桥是**单端口** 10081：网关 /v1 + admin 面板 /admin 同端口。
-          # DSH -> 8788（本插件）-> qoder 桥 :10081/v1。launch.mjs 首跑现场 go build（-mod=vendor，离线可编译）。
-          # 鉴权：新桥用面板建的 API key（Bearer，store.go ConstantTimeCompare）；launch.mjs 首跑播种固定
-          # sk-qoder-local 并与 apiKey 对齐。PAT 不是旧桥的 OAuth token，得用户在 /admin 面板手填。
-          - id: qoder2api-hub
-            label: "Qoder"
-            upstream: "http://127.0.0.1:10081/v1"
-            # 与 launch.mjs 播种的固定 key 对齐（QODER_SEED_API_KEY 默认 sk-qoder-local）。
-            apiKey: "sk-qoder-local"
-            # admin 面板（加账号 PAT、建 API key、看用量）；密码由 QODER_ADMIN_PASSWORD 钉住。
-            adminUrl: "http://127.0.0.1:10081/admin"
-            launch:
-              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
-              args:
-                - "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-go\\launch.mjs"
-              # launch.mjs 按 process.cwd() 找源码并 go build -mod=vendor，必须指到内嵌副本根。
-              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-go"
-              env:
-                # 数据库钉进内嵌副本 data/data.json，保持自包含、不写用户家目录。
-                QODER_DATA_PATH: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\qoder2api-go\\data\\data.json"
-                # admin 面板密码固定（避免每次启动随机生成要翻日志）；仍可在面板改。
-                QODER_ADMIN_PASSWORD: "qoder-local"
-                # 本地单机面板：默认关闭管理员登录界面（后端 requireAuth 已默认放行）。
-                # 设 QODER_DISABLE_PANEL_AUTH: "0" 可恢复登录鉴权。
-                QODER_DISABLE_PANEL_AUTH: "1"
-                HTTPS_PROXY: "http://127.0.0.1:10808"
-                HTTP_PROXY: "http://127.0.0.1:10808"
-                NO_PROXY: "localhost,127.0.0.1"
-              # /health 无鉴权探针（main.go 挂在根 mux）；进程健康即可确认，账号 PAT 后补。
-              readyUrl: "http://127.0.0.1:10081/health"
-              readyTimeoutMs: 60000
-              readyPollMs: 1000
-              killOnStop: true
-            concurrency: 4
-            sessionHoldMs: 60000
-            # 模型清单：新桥 DefaultModelMap 的 13 个 display-name（models/models.go:33-47）。
-            # /v1/models 会在有账号后动态合并上游目录；这里声明这 13 个作静态回显示项。
-            # 全部不声明 reasoningEfforts -> patch-reasoning 里进 FORBIDDEN（efforts 是否可用随上游）。
-            models:
-              - id: Qwen3.8-Max
-                contextWindow: 128000
-              - id: Qwen3.8-Flash
-                contextWindow: 128000
-              - id: Qwen3.7-Max
-                contextWindow: 128000
-              - id: Qwen3.7-Plus
-                contextWindow: 128000
-              - id: Qwen3.7-Flash
-                contextWindow: 128000
-              - id: DeepSeek-V4-Pro
-                contextWindow: 128000
-              - id: DeepSeek-Flash
-                contextWindow: 128000
-              - id: GLM-5.3
-                contextWindow: 128000
-              - id: GLM-5.3-Flash
-                contextWindow: 128000
-              - id: GLM-5.2
-                contextWindow: 128000
-              - id: Kimi-K3
-                contextWindow: 128000
-              - id: Kimi-K2.8-Preview
-                contextWindow: 128000
-              - id: MiniMax-M2.7
-                contextWindow: 128000
-
-
           # trae2api-hub（XCool-603/trae2api，Go 实现的 Trae CN 桥，vendor/trae2api/）：
           # 与已卸载的 shuishuipingan/trae2api-hub（Python，:8791）完全不同的新实现。
           # 零依赖 Go 单文件，launch.mjs 首次跑现场编译；CN 账号从本机 Trae 客户端凭据自动导入。
@@ -1155,40 +1105,6 @@
               high: high
               xhigh: xhigh
               max: max
-
-        qoder2api-hub:
-          displayName: Qoder
-          # EchoPing07/Qoder-2API-Go（vendor/qoder2api-go/）单端口 :10081。DefaultModelMap 的 13 个
-          # display-name（models/models.go:33-47）。/v1/models 有账号后动态合并上游目录，这里声明静态项。
-          # 全部不声明 reasoningEfforts -> patch-reasoning FORBIDDEN（efforts 是否可用随上游）。
-          models:
-            - id: Qwen3.8-Max
-              contextWindow: 128000
-            - id: Qwen3.8-Flash
-              contextWindow: 128000
-            - id: Qwen3.7-Max
-              contextWindow: 128000
-            - id: Qwen3.7-Plus
-              contextWindow: 128000
-            - id: Qwen3.7-Flash
-              contextWindow: 128000
-            - id: DeepSeek-V4-Pro
-              contextWindow: 128000
-            - id: DeepSeek-Flash
-              contextWindow: 128000
-            - id: GLM-5.3
-              contextWindow: 128000
-            - id: GLM-5.3-Flash
-              contextWindow: 128000
-            - id: GLM-5.2
-              contextWindow: 128000
-            - id: Kimi-K3
-              contextWindow: 128000
-            - id: Kimi-K2.8-Preview
-              contextWindow: 128000
-            - id: MiniMax-M2.7
-              contextWindow: 128000
-
 
         trae2api-hub:
           displayName: Trae

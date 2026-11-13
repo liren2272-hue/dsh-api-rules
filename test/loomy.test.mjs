@@ -719,5 +719,149 @@ function cleanTool(name) {
   }
 }
 
+// —————————————————————————————————————————————————————————————————————————————
+// 响应侧 tool_calls.arguments 非法 JSON 修复（2026-11-12 spark-x2.6）——回归
+// 现象：spark 偶发把结构化工具调用的 function.arguments 写成「像 JS 对象字面量、
+//       但不是合法 JSON」的字符串（{"pattern":*,"path":"D:\Program Files\..."}），
+//       DSH 工具层 JSON.parse 失败并报 Unexpected token '*'。
+// 修复：共享模块 tool-call-arguments.mjs（单点真相）由 loomy.normalizeDelta 逐帧调用。
+// 保守契约逐条钉死：合法 JSON 字节不变、分片中间态/修不了原样放行、绝不伪造 {}。
+// —————————————————————————————————————————————————————————————————————————————
+{
+  const { repairToolCallArguments, repairToolCallsInDelta } = await import('../lib/rules/tool-call-arguments.mjs')
+  const BS = String.fromCharCode(92)
+  // 用 <BS> 占位符拼真实样本：JS 字符串字面量里的单反斜杠会被提前吃掉（\P / \r），
+  // 必须先占位、再替换，才能保证到达修复函数的是上游原样的单反斜杠。
+  const decode = (s) => s.split('<BS>').join(BS)
+
+  const ok = (n, c, d) => check('[arguments 修复] ' + n, !!c, d)
+  const eq = (n, a, b) => equal('[arguments 修复] ' + n, a, b)
+  const parseable = (s) => { try { return JSON.parse(s) } catch { return undefined } }
+  const isObj = (v) => v !== undefined && v !== null && typeof v === 'object' && !Array.isArray(v)
+
+  // 真实报错样本：两类畸形同时出现（裸 * 值 + Windows 路径单反斜杠未转义）
+  const realMalformed = decode('{"pattern":*,"path":"D:<BS>Program Files<BS>Deepseek Harness<BS>resources","limit":20}')
+  const wantPath = decode('D:<BS>Program Files<BS>Deepseek Harness<BS>resources')
+
+  // —— 单元：核心修复 ——
+  const fixedReal = repairToolCallArguments(realMalformed)
+  const parsedReal = parseable(fixedReal)
+  ok('真实样本修成合法 JSON 对象', isObj(parsedReal), fixedReal)
+  ok('裸 * 值补成字符串 "*"', parsedReal && parsedReal.pattern === '*', fixedReal)
+  ok('Windows 路径单反斜杠保留（不丢、不多）', parsedReal && parsedReal.path === wantPath, fixedReal)
+  ok('数字参数保留为数字 20', parsedReal && parsedReal.limit === 20, fixedReal)
+
+  // —— 单元：其它畸形类别 ——
+  function repaired(name, raw, want) {
+    const out = repairToolCallArguments(raw)
+    const v = parseable(out)
+    ok(name + ' → 合法 JSON', isObj(v), out)
+    if (want !== undefined) eq(name + ' → 语义', JSON.stringify(v), JSON.stringify(want))
+  }
+  repaired('单引号字符串', decode("{pattern:'**/*.ts', path:'D:<BS>work'}"), { pattern: '**/*.ts', path: decode('D:<BS>work') })
+  repaired('无引号键 + 尾逗号', '{pattern:"*",limit:20,}', { pattern: '*', limit: 20 })
+  repaired('无引号键 + bool/null/数字', '{a:true,b:null,c:20,d:-1.5}', { a: true, b: null, c: 20, d: -1.5 })
+  repaired('裸值 + 单引号混合', decode("{pattern:*,path:'D:<BS>work'}"), { pattern: '*', path: decode('D:<BS>work') })
+
+  // —— 单元：保守契约（合法 / 分片 / 修不了，一律原样返回）——
+  const unchanged = (name, raw) => eq(name + ' → 原样返回', repairToolCallArguments(raw), raw)
+  const validJson = JSON.stringify({ pattern: '**/*', path: wantPath, limit: 20 })
+  unchanged('合法 JSON 字节不变', validJson)
+  unchanged('嵌套合法对象字节不变', '{"files":[{"path":"a.ts","offset":1}],"limit":20}')
+  unchanged('分片前缀（无闭合括号）', decode('{"path":"D:<BS>Pro'))
+  unchanged('分片续串（不以 { 开头）', 'gram Files","limit":20}')
+  unchanged('空串', '')
+  unchanged('已是 {}', '{}')
+  unchanged('顶层数组', '[1,2,3]')
+  unchanged('完全无法修复', 'not even an object')
+
+  // —— 单元：repairToolCallsInDelta ——
+  {
+    const d = { tool_calls: [{ index: 0, function: { name: 'ops_glob', arguments: realMalformed } }] }
+    const ret = repairToolCallsInDelta(d)
+    ok('delta 级修复返回同一对象', ret === d)
+    ok('delta 级 arguments 可解析', isObj(parseable(d.tool_calls[0].function.arguments)), d.tool_calls[0].function.arguments)
+    ok('delta 级 path 保留', parseable(d.tool_calls[0].function.arguments).path === wantPath)
+    const validDelta = { tool_calls: [{ index: 0, function: { name: 'ops_glob', arguments: validJson } }] }
+    repairToolCallsInDelta(validDelta)
+    eq('delta 级合法 JSON 不改', validDelta.tool_calls[0].function.arguments, validJson)
+    const weird = { tool_calls: [{ index: 0, function: { name: 'x', arguments: { a: 1 } } }], content: 'hi' }
+    ok('arguments 非字符串不误伤', (() => { try { repairToolCallsInDelta(weird); return weird.tool_calls[0].function.arguments.a === 1 } catch { return false } })())
+    const noCalls = { content: 'hi' }
+    ok('无 tool_calls 不误伤', (() => { try { repairToolCallsInDelta(noCalls); return noCalls.content === 'hi' } catch { return false } })())
+  }
+
+  // —— 单元：loomyRules.normalizeDelta 接线（两个兜底同时生效）——
+  {
+    const d = { content: null, tool_calls: [{ index: 0, function: { name: 'ops_glob', arguments: realMalformed } }] }
+    loomyRules.normalizeDelta(d)
+    eq('normalizeDelta null content → 空串（不回归）', d.content, '')
+    ok('normalizeDelta 同时修好 arguments', isObj(parseable(d.tool_calls[0].function.arguments)), d.tool_calls[0].function.arguments)
+    const vd = { tool_calls: [{ index: 0, function: { name: 'ops_glob', arguments: validJson } }] }
+    loomyRules.normalizeDelta(vd)
+    eq('normalizeDelta 合法 JSON 不改', vd.tool_calls[0].function.arguments, validJson)
+  }
+
+  // —— E2E：真实起 proxy，喂一段带畸形 arguments 的 tool_calls 流 ——
+  const { createProxy } = await import('../lib/proxy.mjs')
+  const { RuleRegistry } = await import('../lib/registry.mjs')
+  const NL = String.fromCharCode(10)
+  const sse = (frames) => frames.map((f) => 'data: ' + f + NL + NL).join('')
+  const realFetchA = globalThis.fetch
+  const toolCallFrame = (args) => JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'ops_glob', arguments: args } }] }, finish_reason: 'tool_calls' }] })
+  function collectArgs(out) {
+    const result = []
+    for (const line of out.split(NL)) {
+      const t = line.trim()
+      if (!t.startsWith('data: ')) continue
+      const payload = t.slice(6)
+      if (payload === '[DONE]') continue
+      let obj
+      try { obj = JSON.parse(payload) } catch { continue }
+      const c0 = obj && obj.choices && obj.choices[0]
+      const calls = c0 && c0.delta && c0.delta.tool_calls
+      if (Array.isArray(calls)) for (const c of calls) {
+        if (c && c.function && typeof c.function.arguments === 'string') result.push(c.function.arguments)
+      }
+    }
+    return result
+  }
+  async function runArgsStream(frames) {
+    const registry = new RuleRegistry()
+    registry.register(loomyRules)
+    globalThis.fetch = async () => new Response(sse(frames), { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } })
+    let proxy
+    try {
+      proxy = createProxy({ port: 0, autoLaunch: false, registry, routes: [{ id: 'loomy2api', upstream: 'http://127.0.0.1:17890/v1', apiKey: 'sk-loomy-local', rules: ['loomy2api'], timeoutMs: 3600000 }] })
+      await proxy.ready
+      const res = await realFetchA(proxy.origin() + '/loomy2api/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer sk-loomy-local', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'spark-x2.6', stream: true, messages: [{ role: 'user', content: 'x' }] }),
+      })
+      return await res.text()
+    } finally {
+      globalThis.fetch = realFetchA
+      if (proxy) { try { await Promise.race([proxy.close(), new Promise((r) => setTimeout(r, 1500))]) } catch {} }
+    }
+  }
+  try {
+    const malOut = await runArgsStream([toolCallFrame(realMalformed), '[DONE]'])
+    const malArgs = collectArgs(malOut)
+    ok('E2E 输出含 tool_calls arguments', malArgs.length >= 1, malOut.slice(0, 300))
+    const outParsed = malArgs.length ? parseable(malArgs[0]) : undefined
+    ok('E2E 写回帧 arguments 可 JSON.parse', isObj(outParsed), malArgs[0])
+    ok('E2E pattern 修成 "*"', outParsed && outParsed.pattern === '*', malArgs[0])
+    ok('E2E Windows 路径保留', outParsed && outParsed.path === wantPath, malArgs[0])
+
+    const validOut = await runArgsStream([toolCallFrame(validJson), '[DONE]'])
+    const validArgs = collectArgs(validOut)
+    ok('E2E 合法 JSON 输出存在', validArgs.length >= 1, validOut.slice(0, 300))
+    eq('E2E 合法 JSON 字节不变', validArgs[0], validJson)
+  } catch (error) {
+    ok('E2E[arguments 修复] 无异常', false, String((error && error.stack) || error))
+  }
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed')
 process.exit(failures === 0 ? 0 : 1)
