@@ -217,6 +217,11 @@
               readyTimeoutMs: 30000
               readyPollMs: 500
               killOnStop: true
+            # raccoon2api 控制台的管理密钥：面板下方「剩余积分」读取需要它
+            # （控制台 API 要 Bearer 鉴权）。必须写在 launch.env 内：normalizeRoute
+            # 只保留白名单字段，顶层的 env 会被剥掉，插件读不到密钥。
+              env:
+                RACCOON_MANAGEMENT_KEY: "raccoon-local-admin"
             models:
               - id: raccoon/raccoon-19b265
                 name: Raccoon-Work-260817-A

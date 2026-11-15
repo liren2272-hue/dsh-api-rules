@@ -863,5 +863,167 @@ function cleanTool(name) {
   }
 }
 
+// —————————————————————————————————————————————————————————————————————————————
+// 正文死循环检测（2026-11-15）——回归
+// 现象：长上下文下 spark-x2.6 的正文退化成「工具调用闭合标记无限刷」，
+//       单条 assistant/message 实测 19 万字符仍在逐 token 生成，用户只能手动打断。
+// 根因：①proxy 的死循环守卫只在思考阶段（!sawContent）生效，正文阶段零保护；
+//       ②containsToolCallDraft 要求「同一套标记两类共现」，只刷 </invoke>/</parameter>
+//         的退化只命中一类，连「草稿当答案」续推兜底也不触发。
+// 修复：registry 新增 contentLimitFrame 缺省钩子；proxy 主循环 + 续推循环在
+//       sawContent && !sawToolCall && !sawFinishReason 时逐帧问；loomy 规则包按
+//       「尾部窗口闭合标记密集」或「尾部 24 字片段复述占满半窗」判定，命中即报
+//       content_loop 错误帧 + [DONE] 并掐断上游。
+// —————————————————————————————————————————————————————————————————————————————
+{
+  const clf = (meta) => loomyRules.contentLimitFrame(meta)
+  check('[正文死循环] contentLimitFrame 是函数', typeof loomyRules.contentLimitFrame === 'function')
+
+  // 造「长而不重复」的正常正文（尾窗内 24 字 n-gram 各只出现一次），用于误杀对照。
+  const variedProse = (n) => {
+    const verbs = ['拆解', '检索', '比对', '归纳', '验证', '推翻', '重构', '收敛']
+    const objs = ['问题边界', '隐含前提', '反例', '成本', '时序依赖', '接口契约', '边界条件', '解空间']
+    let s = ''
+    for (let i = 0; s.length < n; i++) {
+      s += '【' + i + '】' + verbs[i % 8] + objs[(i * 3) % 8] + '，结合上文第' + (i - 1) + '条与第' + (i - 2) + '条，判断是否需要回溯。'
+    }
+    return s
+  }
+
+  // 1) 真实退化样本（取失败会话的原文形状）
+  const degenerate = '<acp_bash_not_needed>\n' + '</invoke>\n</parameter>\n'.repeat(60)
+  const hit = clf({ contentText: degenerate, contentChunks: 120 })
+  check('[正文死循环] 退化样本命中', hit !== undefined, JSON.stringify(hit)?.slice(0, 200))
+  check('[正文死循环] reason=closing-tag-spam', hit?._content_loop?.reason === 'closing-tag-spam', JSON.stringify(hit?._content_loop))
+  check('[正文死循环] error.type=content_loop', hit?.error?.type === 'content_loop', JSON.stringify(hit?.error))
+  check('[正文死循环] error.code=504', hit?.error?.code === 504, JSON.stringify(hit?.error))
+  check('[正文死循环] 收尾不是伪造 finish_reason（不伪装正常完成）', hit?.choices === undefined && hit?.error !== undefined)
+
+  // 2) 窗口不足不判（避免刚开正文就误杀）
+  check('[正文死循环] 正文不足一个窗口不判', clf({ contentText: '</invoke>\n'.repeat(30) }) === undefined)
+
+  // 3) 正常长正文不误杀
+  const normalLong = variedProse(1500)
+  check('[正文死循环] 正常长正文不误杀', clf({ contentText: normalLong, contentChunks: 60 }) === undefined, JSON.stringify(clf({ contentText: normalLong }))?.slice(0, 200))
+
+  // 4) 在反引号/代码围栏里讲解工具调用标记是正常回答，不能误杀
+  const fenced = variedProse(900) + '```\n' + '</invoke>\n</parameter>\n'.repeat(20) + '```'
+  check('[正文死循环] 代码围栏内的标记不误杀', clf({ contentText: fenced }) === undefined)
+  const unclosedFence = variedProse(900) + '```\n' + '</invoke>\n</parameter>\n'.repeat(20)
+  check('[正文死循环] 未闭合围栏（流式中途）不误杀', clf({ contentText: unclosedFence }) === undefined)
+  const inlineCode = variedProse(900) + '`</invoke>`'.repeat(30)
+  check('[正文死循环] 行内反引号里的标记不误杀', clf({ contentText: inlineCode }) === undefined)
+
+  // 4b) 代码块整体远长于尾部窗口（800 字）时，开栏落在窗口之外——
+  //     若先取窗口再剥代码片段，收尾那个 ``` 会把块内标记误留成正文（实测误杀过）。
+  const longFenceClosed = variedProse(900) + '```\n' + '</invoke>\n</parameter>\n'.repeat(60) + '```\n' + variedProse(700)
+  check('[正文死循环] 跨尾部窗口的完整围栏不误杀', clf({ contentText: longFenceClosed }) === undefined, JSON.stringify(clf({ contentText: longFenceClosed })?._content_loop))
+  const longFenceOpen = variedProse(900) + '```\n' + '</invoke>\n</parameter>\n'.repeat(60) + variedProse(300)
+  check('[正文死循环] 跨尾部窗口的未闭合围栏不误杀', clf({ contentText: longFenceOpen }) === undefined, JSON.stringify(clf({ contentText: longFenceOpen })?._content_loop))
+  // 反向闸门：剥代码片段不能剥过头——围栏之后真正裸写的大片标记仍必须被抓到。
+  const afterLongFence = variedProse(900) + '```\n' + '</invoke>\n</parameter>\n'.repeat(20) + '```\n' + '</invoke>\n</parameter>\n'.repeat(60)
+  check('[正文死循环] 长围栏之后的裸标记仍被抓到', clf({ contentText: afterLongFence })?._content_loop?.reason === 'closing-tag-spam', JSON.stringify(clf({ contentText: afterLongFence })?._content_loop))
+
+  // 4c) 对抗式复核查出的两处误杀（2026-11-15）：重复兜底 dominantRepeatInTail 原先也是
+  //     「先取 800 字窗口、再剥代码片段」，跨窗口的围栏会让块内重复内容泄漏成正文重复。
+  const fencedRepeatLines = '说明：\n```\n' + '2026-11-15 16:00:00 INFO retry\n'.repeat(60) + '```\n' + variedProse(200)
+  check('[正文死循环] 长围栏内重复的日志行不误杀', clf({ contentText: fencedRepeatLines }) === undefined, JSON.stringify(clf({ contentText: fencedRepeatLines })?._content_loop))
+  const fencedManyTags = '说明：\n```\n' + '</invoke>\n</parameter>\n'.repeat(50) + '```\n' + variedProse(200)
+  check('[正文死循环] 长围栏内的大量标记不误杀', clf({ contentText: fencedManyTags }) === undefined, JSON.stringify(clf({ contentText: fencedManyTags })?._content_loop))
+  const bareLogLines = variedProse(400) + '2026-11-15 16:00:00 INFO retry\n'.repeat(40)
+  check('[正文死循环] 裸正文里 40 行相同日志行不误杀（覆盖率未到八成）', clf({ contentText: bareLogLines }) === undefined, JSON.stringify(clf({ contentText: bareLogLines })?._content_loop))
+
+  // 4d) 阈值上下边界：正文里逐个列举闭合标记名是正当写法（一句能点 6-7 个），阈值取 8。
+  const TAG_NAMES = ['</invoke>', '</parameter>', '</function>', '</function_calls>', '</tool_call>', '</arg_key>', '</arg_value>', '</antml:invoke>']
+  check('[正文死循环] 正文枚举 7 个闭合标记名不误杀', clf({ contentText: variedProse(900) + '支持的闭合标记有：' + TAG_NAMES.slice(0, 7).join('、') }) === undefined)
+  check('[正文死循环] 正文枚举 8 个闭合标记名命中', clf({ contentText: variedProse(900) + '支持的闭合标记有：' + TAG_NAMES.join('、') })?._content_loop?.reason === 'closing-tag-spam')
+
+  // 5) 通用重复兜底（非标记类退化：同一句被复述到占满八成窗口）
+  const repText = '让我再确认一遍刚才那个结论。'.repeat(80)
+  const repHit = clf({ contentText: repText, contentChunks: 80 })
+  check('[正文死循环] 无标记重复兜底命中', repHit?._content_loop?.reason === 'repetition', JSON.stringify(repHit?._content_loop))
+  check('[正文死循环] 重复兜底同样报 content_loop', repHit?.error?.type === 'content_loop', JSON.stringify(repHit?.error))
+
+  // 6) 正文里偶发提到一个闭标签（低于阈值）不误杀
+  check('[正文死循环] 偶发单个闭标签不误杀', clf({ contentText: variedProse(1200) + '\n例如 </invoke> 这样的标记。' }) === undefined)
+
+  // 7) 契约：registry 缺省钩子 + proxy 链助手（两处循环都接上）
+  const { normalizePack } = await import('../lib/registry.mjs')
+  const defaults = normalizePack({ name: '__probe_content_defaults__' })
+  check('[正文死循环] registry 默认包含 contentLimitFrame', typeof defaults.contentLimitFrame === 'function')
+  check('[正文死循环] 默认包仍不含 isIncompleteTurn（续推链 find 不错位）', !('isIncompleteTurn' in defaults))
+  const pluginRoot3 = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const proxySrc3 = readFileSync(join(pluginRoot3, 'lib/proxy.mjs'), 'utf8')
+  const registrySrc3 = readFileSync(join(pluginRoot3, 'lib/registry.mjs'), 'utf8')
+  const loomySrc3 = readFileSync(join(pluginRoot3, 'lib/rules/loomy.mjs'), 'utf8')
+  check('[正文死循环] registry DEFAULTS 声明 contentLimitFrame', /contentLimitFrame: \(\) => undefined/.test(registrySrc3))
+  check('[正文死循环] proxy 定义 contentLimitFrameOf 链助手', /function contentLimitFrameOf\(packs, meta\)/.test(proxySrc3))
+  check('[正文死循环] proxy 主流与续推流都查正文死循环', (proxySrc3.match(/contentLimitFrameOf\(packs, /g) ?? []).length >= 3)
+  check('[正文死循环] 文案只在规则层（框架不硬编码）', /'content_loop'/.test(loomySrc3) && !/content_loop/.test(proxySrc3))
+
+  // 8) containsToolCallDraft 第三路判据（闭合标签草稿也算「草稿当答案」）
+  const itm = { sawContent: true, sawToolCall: false, sawFinishReason: true, sentAnything: true }
+  check(
+    '[正文死循环] 闭合标签草稿 → isIncompleteTurn 为真',
+    loomyRules.isIncompleteTurn('spark-x2.6', { ...itm, contentText: variedProse(300) + '</invoke>\n</parameter>\n'.repeat(4) }) === true,
+  )
+  check(
+    '[正文死循环] 单个闭标签不算草稿',
+    loomyRules.isIncompleteTurn('spark-x2.6', { ...itm, contentText: variedProse(300) + '</invoke>' }) === false,
+  )
+  check(
+    '[正文死循环] 围栏内的标记不算草稿',
+    loomyRules.isIncompleteTurn('spark-x2.6', { ...itm, contentText: '```\n' + '</invoke>\n</parameter>\n'.repeat(10) + '```' }) === false,
+  )
+
+  // 9) E2E：喂「无限刷 </invoke>」的流，断言提前掐断并报 content_loop；正常长文不误杀。
+  const { createProxy } = await import('../lib/proxy.mjs')
+  const { RuleRegistry } = await import('../lib/registry.mjs')
+  const NL3 = String.fromCharCode(10)
+  const sse3 = (frames) => frames.map((f) => 'data: ' + f + NL3 + NL3).join('')
+  const realFetch3 = globalThis.fetch
+
+  async function runStream3(frames) {
+    const registry = new RuleRegistry()
+    registry.register(loomyRules)
+    globalThis.fetch = async () => new Response(sse3(frames), { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8' } })
+    let proxy
+    try {
+      proxy = createProxy({ port: 0, autoLaunch: false, registry, routes: [{ id: 'loomy2api', upstream: 'http://127.0.0.1:17890/v1', apiKey: 'sk-loomy-local', rules: ['loomy2api'], timeoutMs: 3600000 }] })
+      await proxy.ready
+      const res = await realFetch3(proxy.origin() + '/loomy2api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer sk-loomy-local', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'spark-x2.6', stream: true, messages: [{ role: 'user', content: 'x' }] }),
+      })
+      return await res.text()
+    } finally {
+      globalThis.fetch = realFetch3
+      if (proxy) { try { await Promise.race([proxy.close(), new Promise((r) => setTimeout(r, 1500))]) } catch {} }
+    }
+  }
+
+  try {
+    const spamChunk = JSON.stringify({ choices: [{ index: 0, delta: { content: '</invoke>\n</parameter>\n' } }] })
+    const spamOut = await runStream3(Array(300).fill(spamChunk))
+    check('E2E[正文死循环] 命中 content_loop 错误帧', spamOut.includes('"type":"content_loop"'), spamOut.slice(0, 300))
+    check('E2E[正文死循环] 有 [DONE] 收尾', spamOut.includes('[DONE]'))
+    check('E2E[正文死循环] 不补合成 stop（不伪装正常完成）', !spamOut.includes('"finish_reason":"stop"'), spamOut.slice(0, 300))
+    const forwarded = (spamOut.match(/"content"/g) ?? []).length
+    check('E2E[正文死循环] 提前掐断（300 帧远未转发完）', forwarded < 100, 'forwarded=' + forwarded)
+    check('E2E[正文死循环] 客户端收到的正文远小于退化规模', forwarded * 23 < 4000, 'forwarded=' + forwarded)
+
+    const normalOut = await runStream3([
+      JSON.stringify({ choices: [{ index: 0, delta: { content: variedProse(1200) } }] }),
+      JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+      '[DONE]',
+    ])
+    check('E2E[正文死循环] 正常长正文不误杀（保留上游 stop）', normalOut.includes('"finish_reason":"stop"'), normalOut.slice(0, 300))
+    check('E2E[正文死循环] 正常流无 content_loop', !normalOut.includes('content_loop'), normalOut.slice(0, 300))
+  } catch (error) {
+    check('E2E[正文死循环] 无异常', false, String((error && error.stack) || error))
+  }
+}
+
 console.log('\n' + passes + ' passed, ' + failures + ' failed')
 process.exit(failures === 0 ? 0 : 1)

@@ -29,16 +29,18 @@ function createFakeWebServer() {
 }
 
 /** 新增路由时同步改这里，并补一条对应的 has 断言。 */
-const ROUTE_COUNT = 6
+const ROUTE_COUNT = 9
 /** 六条路由的完整清单：计数与清单一起维护，新增路由时两边都补。
  *  （models-sync、media-generate 均为后续新增；媒体转发见 goal-58ba6a2c。） */
 const ROUTE_PATHS = [
   '/api/api-rules/accounts',
+  '/api/api-rules/detail',
   '/api/api-rules/account',
   '/api/api-rules/codearts-account',
   '/api/api-rules/minimax-account',
   '/api/api-rules/models-sync',
   '/api/api-rules/media-generate',
+  '/api/api-rules/points',
 ]
 
 function makeCtx(webServer, disposers) {
@@ -68,7 +70,7 @@ test('inject 回调交还 disposer，重载不撞重复路由', async (t) => {
   const config = { port: 8788, routes: [{ id: 'codearts', signer: 'huawei', rules: ['codearts'] }] }
 
   apply(makeCtx(webServer, disposers), config)
-  assert.equal(webServer.table.size, ROUTE_COUNT, '六条路由应全部注册')
+  assert.equal(webServer.table.size, ROUTE_COUNT, '七条路由应全部注册')
   for (const path of ROUTE_PATHS) assert.ok(webServer.table.has('exact ' + path), '缺路由: ' + path)
   assert.ok(webServer.table.has('exact /api/api-rules/minimax-account'), '新增的 minimax-account 路由必须注册上')
 
@@ -78,9 +80,10 @@ test('inject 回调交还 disposer，重载不撞重复路由', async (t) => {
   assert.ok(!webServer.table.has('exact /api/api-rules/minimax-account'), 'unload 后 minimax-account 路由也必须摘掉')
   assert.ok(!webServer.table.has('exact /api/api-rules/models-sync'), 'unload 后 models-sync 路由也必须摘掉')
   assert.ok(!webServer.table.has('exact /api/api-rules/media-generate'), 'unload 后 media-generate 路由也必须摘掉')
+  assert.ok(!webServer.table.has('exact /api/api-rules/points'), 'unload 后 points 路由也必须摘掉')
 
   assert.doesNotThrow(() => apply(makeCtx(webServer, disposers), config), '重载不应撞 duplicate route')
-  assert.equal(webServer.table.size, ROUTE_COUNT, '重载后仍是六条路由')
+  assert.equal(webServer.table.size, ROUTE_COUNT, '重载后仍是七条路由')
   assert.ok(webServer.table.has('exact /api/api-rules/minimax-account'), '重载后 minimax-account 仍在')
   for (const dispose of disposers.splice(0)) dispose()
 })
@@ -108,7 +111,7 @@ test('重复注册同一路径确实会抛错（负向对照，证明上面的�
   apply(ctxNoDispose, config)
   assert.throws(
     () => apply(ctxNoDispose, config),
-    /duplicate exact route "\/api\/api-rules\/accounts"/,
+    /duplicate exact route "\/api\/api-rules\/diag"/,
     '不交还 disposer 时第二遍 apply 必须撞重复路由——这正是事故现场的机制',
   )
 })

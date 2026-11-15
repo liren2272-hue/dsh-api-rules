@@ -118,16 +118,29 @@ async function mount(payload) {
 
   const { apply } = factoryFn((id) => {
     if (id === 'react') return React
+    // composer 积分浮层用 createPortal 挂 document.body；测试环境给个透传桩。
+    if (id === 'react-dom') return { createPortal: (el) => el }
     throw new Error('unexpected require: ' + id)
   })
   let cardEl = null
+  let composerEl = null
   apply({
     effect: (fn) => { fn() },
     locale,
-    slots: { inject: (_n, f) => { cardEl = f() }, register: (_m, f) => f() },
+    slots: {
+      inject: (_n, f) => {
+        const el = f()
+        if (_n === 'plugins.bundle.config') cardEl = el
+        if (_n === 'conversation.input.right') composerEl = el
+        return el
+      },
+      register: (_m, f) => f(),
+    },
   })
   assert.ok(cardEl, 'card element must be registered on the plugins.bundle.config slot')
   assert.equal(typeof cardEl.type, 'function', 'slot must yield the ApiRulesCard element')
+  assert.ok(composerEl, 'composer points must be registered on the conversation.input.right slot')
+  assert.equal(typeof composerEl.type, 'function', 'composer slot must yield its render element')
 
   const render = () => {
     hookIdx = 0
@@ -151,7 +164,7 @@ async function mount(payload) {
   for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r)) // flush the async load()
   tree = render()
 
-  return { tree, render, store, dicts, cleanup, restore }
+  return { tree, render, store, dicts, cleanup, restore, composerEl }
 }
 
 // Locate the activeTab useState slot: a string-valued slot whose value flips aria-selected
