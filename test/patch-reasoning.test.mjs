@@ -41,17 +41,11 @@ const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhi
 //   codearts/GLM-5.2                       -> [minimal, low, medium, high, xhigh, max]
 //   codearts/glm-5.3                       -> [low, high, max]
 //   codearts/deepseek-v4.1-flash           -> [low, medium, high, xhigh, max]
-//   loomy2api/<chat>                       -> [low, medium, high, xhigh]
 //   cline-free/* / nvidia/*                 -> [minimal, low, medium, high, xhigh, max]
 //     （2026-11-06 只保留有权限的 3 个免费模型；Vercel/Openrouter 上游实测拒绝非法值）
 //   raccoon/*                              -> [low, medium, high]
 //     （raccoon2api 插件归一化：off/none/minimal -> low；GLM/Kimi 的 medium -> high）
 const EXPECTED = new Map([
-  // 2026-11-08 17:11 探针（tmp/probe-all-efforts.json）在 8788 上实测：
-  // 其余档位 200），loomy2api 的 qwen-3.8-max / auto 也补了声明。这五条曾经在
-  // FORBIDDEN 里（「无思考配置，不声明」），补声明后白名单必须同步，否则本测试会红。
-  ['loomy2api/qwen-3.8-max', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['loomy2api/auto', ['low', 'medium', 'high', 'xhigh', 'max']],
   // 2026-11-09 minimax2api（MiniMax Agent 官方客户端网关，:8080）：
   // 它不认 OpenAI 的 reasoning_effort 档位，只认布尔 `thinking`；规则层
   // （lib/rules/minimax2api.mjs:112-118）把任何非 off/none/disabled/minimal 的档位
@@ -91,12 +85,6 @@ const EXPECTED = new Map([
   ['officeace/kimi-k3', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['officeace/qwen3-30b-a3b', ['low', 'medium', 'high', 'xhigh', 'max']],
   ['officeace/qwen3-32b', ['low', 'medium', 'high', 'xhigh', 'max']],
-  ['loomy2api/spark-x2.6', ['low', 'medium', 'high', 'xhigh']],
-  ['loomy2api/DeepSeek-V4.1-Flash', ['low', 'medium', 'high', 'xhigh']],
-  ['loomy2api/deepseek-v4-flash-0731', ['low', 'medium', 'high', 'xhigh']],
-  ['loomy2api/GLM-5.3-Flash', ['low', 'medium', 'high', 'xhigh']],
-  ['loomy2api/qwen3.8-flash', ['low', 'medium', 'high', 'xhigh']],
-  ['loomy2api/mimo-v2.5', ['low', 'medium', 'high', 'xhigh']],
   // Auto / Efficient / Fast 无思考配置，不声明 reasoningEfforts（选择器不出现档位菜单）。
   ['cline/cline-free/nemotron-3.5-super-vl', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],
   ['cline/cline-free/solar-mini4', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']],

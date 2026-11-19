@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "同济 AIGC 生图 / 生视频",
+    "description": "把同济 AIGC 专区（agi.tongji.edu.cn）的文生图、图生图、文生视频、图生视频等能力反向代理进 DSH：浏览器跳转登录，宿主侧注册全套工具，产物落盘返回绝对路径。",
+    "detail": "docs/USAGE.md"
+  }
+}

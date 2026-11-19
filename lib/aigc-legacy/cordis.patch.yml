@@ -1,0 +1,25 @@
+# dsh-tongji-aigc：把同济 AIGC 专区的生图/生视频能力反向代理进 DSH。
+#
+# 本插件不转发聊天流量，也不拉起任何常驻进程：
+#   - 宿主侧（lib/index.js）直接以 `Authorization: Bearer <JWT>` 请求
+#     https://agi.tongji.edu.cn/api/v1，注册生图/生视频/模板/任务/报价等工具；
+#   - 客户端（lib/client/index.js）在「设置 → 插件」里提供一张卡片：
+#     「打开登录页」用系统浏览器跳转到 agi.tongji.edu.cn，登录后把 access_token
+#     粘贴回卡片，插件校验并只存本机；
+#   - 令牌落盘在 `~/.dsh/.tongji-aigc/token.json`，与上游站点完全隔离。
+#
+# 想改站点地址或默认行为，直接在 profile 的 cordis.patch.yml 里给这条 entry 加 config：
+#   - id: dsh-tongji-aigc
+#     name: '@local/dsh-tongji-aigc'
+#     config:
+#       baseUrl: 'https://agi.tongji.edu.cn/api/v1'
+#       pollIntervalMs: 2000
+- insert:
+    - id: dsh-tongji-aigc
+      name: '@local/dsh-tongji-aigc'
+      config:
+        baseUrl: 'https://agi.tongji.edu.cn/api/v1'
+        # 任务轮询间隔（毫秒）。视频生成通常要几十秒到几分钟。
+        pollIntervalMs: 2000
+        # 单次任务轮询上限（毫秒），超时即报「仍在排队/运行」。
+        pollTimeoutMs: 600000

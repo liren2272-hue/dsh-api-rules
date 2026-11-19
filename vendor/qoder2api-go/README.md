@@ -1,0 +1,526 @@
+# Qoder-2API-Go
+
+> Qoder2API 的 Go 语言实现 —— 将 Qoder AI 服务桥接为 OpenAI 兼容 API。
+
+本项目参考 [fengyinxia/qoder2api: QoderWork -> OpenAI compatible API bridge (dynamic model loading, pure Python)](https://github.com/fengyinxia/qoder2api) ，将原有 Python 代码完整重写为 Go，保留了全部核心功能，同时提升了性能与部署便利性。
+
+## 功能特性
+
+- **OpenAI API 兼容** —— 支持 `/v1/chat/completions` 和 `/v1/models` 端点，可无缝替换 OpenAI API
+- **流式响应** —— 支持 SSE 流式输出；`stream_options.include_usage: true` 时末尾附带 usage 帧（含输入 / 输出 / 缓存命中 / 思考 token 与实际扣费额度）
+- **参数完全透传** —— `reasoning_effort`、`max_tokens`、`temperature` 等参数原样转发网关，不做本地校验/钳制/映射；网关拒绝时按真实状态码与原文回传客户端
+- **真实用量统计** —— `/v1/chat/completions` 响应携带网关真实 token 用量：`usage.prompt_tokens` / `completion_tokens` / `total_tokens`、`prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`，以及 Qoder 扩展字段 `credits`（实际扣费额度）/ `original_credits`（折扣前额度）
+- **多模态支持** —— 支持图片输入
+- **Tool Calls** —— 支持函数调用
+- **模型动态加载** —— 自动从网关获取可用模型列表
+- **多账号池 + 请求负载均衡** —— 支持多个 Qoder PAT 池化管理（国内版 / 国际版可按账号分别指定区域）：请求按策略（粘性轮换 / 纯轮询 / 最少在途）分散到不同账号，避免全部压在一个账号上；剩余积分低于阈值（默认 20，面板可调）的账号自动停止接新请求，硬耗尽的账号冷却到下次重置点；请求撞上游 401/403 时冷却失败号并自动改投其它账号重试（客户端无感）；模型名可用 `cn/`、`gl/`、`auto/` 前缀指定区域；旧版单 PAT 配置自动迁移为池中的「默认账号」
+- **Web 管理面板** —— 浅色排版风格中文界面（支持深浅模式），支持密码登录、API 密钥管理、多账号池（多 PAT 添加 / 额度检测 / 权重 / 每日签到 / 负载均衡设置）、模型查看、请求统计（总量 / 成功失败 / 总输入 / 总输出 / 缓存命中 / **本服务实际扣费额度与均值** / 本周期扣费与重置倒计时 / 按模型消耗 / 近 24 小时趋势）
+- **请求日志** —— 记录每次调用的元信息（时间、模型、密钥、流式与否、token 用量、扣费额度、耗时、状态码与错误摘要，不保存对话内容），面板「日志」页支持按模型 / 密钥 / 状态筛选与分页，保留天数与条数上限可配置、自动清理最旧条目
+- **订阅周期感知** —— 从网关 `/algo/api/v3/user/status` 读取真实订阅信息（套餐、组织、`nextResetAt` 重置时间、`isQuotaExceeded` 超额标记），使面板额度按计费周期统计而非终身累计
+- **单文件部署** —— 编译为单一二进制文件，零外部依赖
+
+## 支持的模型
+
+| 显示名称 | 内部 Key |
+| ----------------- | -------------- |
+| Qwen3.8-Max | qmodel_38max |
+| Qwen3.8-Flash | qfmodel |
+| Qwen3.7-Max | qmodel_latest |
+| Qwen3.7-Plus | qmodel |
+| Qwen3.7-Flash | q37fmodel |
+| DeepSeek-V4-Pro | dmodel |
+| DeepSeek-Flash | dfmodel |
+| GLM-5.3 | gmodel |
+| GLM-5.3-Flash | gfmodel |
+| GLM-5.2 | gm51model |
+| Kimi-K3 | kmodel_latest |
+| Kimi-K2.8-Preview | kmodel |
+| MiniMax-M2.7 | mmodel |
+
+> 以上为内置默认列表（catalog-v7，2026-10-07），实际可用模型以网关动态返回为准。
+>
+> 动态列表由网关 `model/list` 的 `chat` 与 `app` 两个 scene 合并而成（按显示名去重，`chat` 优先），因为个别模型只出现在单个 scene 中——例如限时匿名模型 QoDuck (`lmodel`) 仅出现在 `app` 里，只读 `chat` 会把它整条丢掉。此类限时模型不写入内置默认列表。
+>
+> **关于图片输入**：部分模型并非原生多模态，而是由网关对图片附带辅助识别（非原生多模态模型加上辅助后实际可以识图），因此上表不再标注是否支持视觉；识图效果以实际调用结果为准。
+
+## 快速开始
+
+### 方式一：直接运行
+
+```bash
+# 编译
+go build -o qoder2api .
+
+# 运行（默认监听 0.0.0.0:10081）
+./qoder2api
+```
+
+> 收到 `SIGINT`（Ctrl+C）或 `SIGTERM` 会触发优雅关闭：停止接受新连接、等待在途请求并落盘统计后退出。
+
+### 方式二：Docker 部署
+
+```bash
+# 使用 docker-compose
+docker-compose up -d
+
+# 或手动构建（可传 VERSION 构建参数，登录页将显示对应版本号，缺省为 dev）
+docker build --build-arg VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev) -t qoder2api .
+docker run -d -p 10081:10081 -v qoder2api-data:/app/data -e QODER_DATA_PATH=/app/data/data.json qoder2api
+```
+
+### 方式三：下载预编译二进制
+
+前往 [Releases](https://github.com/EchoPing07/Qoder-2API-Go/releases) 下载对应平台的二进制文件，直接运行即可。
+
+### 方式四：macOS 后台服务（launchd，登录自启）
+
+仓库自带 `scripts/service.sh`，把服务注册为登录自启的 launchd 任务（`~/Library/LaunchAgents`），进程存活由 launchd 托管。
+
+```bash
+scripts/service.sh install    # 写入 plist；二进制不存在时自动从源码构建
+scripts/service.sh start      # 启动并等待 /health
+scripts/service.sh status     # 状态 + 健康检查
+scripts/service.sh restart    # 重启（重新加载 plist）
+scripts/service.sh stop       # 停止（下次登录仍会自启）
+scripts/service.sh off        # 停止并禁止登录自启；on 恢复
+scripts/service.sh logs       # 跟随 stderr 日志（应用的 log 输出都在这里）
+scripts/service.sh logs --out # 跟随 stdout 日志（正常时基本为空）
+scripts/service.sh update     # 重新构建二进制并重启
+```
+
+可用环境变量覆盖默认值：
+
+| 变量名 | 默认值 | 说明 |
+| ------- | -------- | ------ |
+| `QODER_BIN` | `~/.local/bin/qoder2api` | 安装的二进制路径 |
+| `QODER_DATA_DIR` | `~/.local/share/qoder2api` | 运行目录（`data.json` 与日志） |
+| `QODER_LABEL` | `com.qoder2api.service` | launchd label |
+
+> 仅支持 macOS（依赖 `launchctl` / `codesign`），其他系统会直接报错退出；Linux 请直接运行二进制或使用 Docker。
+>
+> 默认路径刻意避开 `~/Documents` 等受保护目录：launchd 启动的进程会被 macOS TCC 拦截，读不到这些目录里的文件。
+>
+> **端口归属**：脚本不把端口写进 plist，服务读取 `data.json` 里的端口，因此面板改端口后 `restart` 即生效。注意 `QODER_PORT` 环境变量优先级高于 `data.json`（见下方环境变量表），若在 launchd 之外又设了它，面板的端口配置会被覆盖。
+>
+> **日志**：应用的 `log.Printf` 全部写 stderr，所以 `logs` 默认跟随 stderr；`logs --out` 才看 stdout。
+>
+> **卸载**：`off` 只停服务并取消登录自启，不删除 plist 与二进制；彻底清理需手动删除 `~/Library/LaunchAgents/<label>.plist`、`$QODER_BIN` 与 `$QODER_DATA_DIR`（内含 `data.json`，含 PAT 等敏感数据）。
+
+## 配置
+
+### 环境变量
+
+| 变量名 | 默认值 | 说明 |
+| ------- | -------- | ------ |
+| `QODER_HOST` | `0.0.0.0` | 监听地址 |
+| `QODER_PORT` | `10081` | 监听端口 |
+| `QODER_DATA_PATH` | `data.json` | 数据文件路径 |
+| `QODER_ADMIN_PASSWORD` | `password` | 管理面板密码（覆盖 data.json 中的值） |
+| `QODER_SIGNATURE_SECRET` | 内置值 | 请求签名密钥 |
+| `QODER_CHAT_TIMEOUT_SECONDS` | `120` | Chat 响应超时：等待上游开始响应（返回响应头）的最长秒数，范围 1-3600；设置后管理面板中不可修改 |
+| `QODER_IDLE_TIMEOUT_SECONDS` | `300` | 流空闲超时：流式响应中持续无数据的最长等待秒数，范围 1-3600（数据持续到达时流不会被中断）；设置后管理面板中不可修改 |
+| `QODER_MAX_CONCURRENCY` | `1` | 单 PAT 同时发往上游的聊天请求数上限；超出部分本地排队等待。调大会提升吞吐，但超过 Qoder 账号的并发窗口时网关会拒绝请求（业务码 10605） |
+| `QODER_LOG_RETENTION_DAYS` | `90` | 请求日志保留天数，范围 1-3650；超期条目自动删除。设置后管理面板中不可修改 |
+| `QODER_LOG_MAX_ENTRIES` | `2000` | 请求日志条数上限，范围 100-100000；超限时自动删除最旧条目，与保留天数同时生效。设置后管理面板中不可修改 |
+| `QODER_RUNTIME_INFO` | 空 | 覆盖签到用设备指纹 helper 的路径（标准输出 `machineToken/machineType/machineCode`）。未安装 Qoder 桌面 App 时用于提供真实指纹 |
+| `QODER_CORS_ORIGINS` | 空（用面板配置） | 允许跨域访问 `/v1/*` 与 `/health` 的来源：`*` 表示任意来源，或逗号分隔的完整 Origin（如 `https://app.example.com`）。设置后覆盖管理面板「设置 → 跨域（CORS）」里的开关与来源，并锁定面板编辑；未设置时以面板配置为准。自动处理 `OPTIONS` 预检；管理后台接口不参与 CORS。无法解析的条目启动时打印 `WARN` |
+
+> 两个超时也可在管理面板「设置 → 超时配置」中修改，保存后即时生效（无需重启）。响应超时只约束上游「开始响应」，不会截断已经建立的流。
+
+> 跨域来源按完整 Origin（`http(s)://host[:port]`）比对：不支持子域通配（`https://*.example.com` 会被拒绝），且比较时忽略大小写与默认端口（`https://a.com:443` 等同于 `https://a.com`），因为浏览器发送 Origin 时省略默认端口。多个来源用逗号分隔；`*` 与具名来源混用等于全部放行。
+
+> 请求统计（`stats` 字段）与请求日志（`logs` 字段）随 data.json 持久化：服务每 30 秒批量写入一次，并在收到 `SIGINT`/`SIGTERM` 优雅关闭时执行最终落盘；仅统计通过密钥鉴权且请求体合法的调用，客户端主动断开不计入失败。令牌用量（总输入 / 总输出 / 缓存命中 / 实际扣费额度）从网关 usage 帧自动累计，流中断无 usage 帧时仅计次不计量。请求日志同样只记录通过密钥鉴权的调用（鉴权失败不记录），错误信息截断至 500 字符，日志配置亦可在管理面板「设置 → 日志配置」中修改并即时生效。
+
+### 配置文件 (data.json)
+
+首次运行时自动生成，也可通过 Web 管理面板修改：
+
+```json
+{
+  "host": "0.0.0.0",
+  "port": 10081,
+  "pat": "pt-xxxxxxxx",
+  "password": "password",
+  "chat_timeout_seconds": 120,
+  "idle_timeout_seconds": 300,
+  "log_retention_days": 90,
+  "log_max_entries": 2000,
+  "cors_enabled": false,
+  "cors_origins": "",
+  "api_keys": [
+    {
+      "id": "xxxxxxxx",
+      "key": "sk-xxxxxxxxxxxxxxxx",
+      "note": "备注",
+      "created_at": 1234567890
+    }
+  ]
+}
+```
+
+## 健康检查
+
+`GET /health` 返回服务状态（免鉴权，供容器探针 / 负载均衡使用）：
+
+```json
+{
+  "status": "ok",
+  "has_pat": true,
+  "chat_timeout_seconds": 120,
+  "idle_timeout_seconds": 300
+}
+```
+
+## 使用方法
+
+### 1. 配置 PAT
+
+启动服务后访问 `http://localhost:10081/admin`，输入默认密码 `password` 登录，在「账号」标签页中添加你的 Qoder PAT（支持多个账号；旧版的「令牌」配置会自动迁移为池中的「默认账号」）。添加时需选择令牌所属**区域**：国内版（`qoder.com.cn`）或国际版（`qoder.sh`），区域与令牌不匹配时上游会返回 `personal token is invalid`。重复提交相同 PAT 视为把该账号设为激活账号。
+
+> 🌍 **国际版支持**：国际版账号的聊天/状态走 `api1.qoder.sh`，额度查询走 `openapi.qoder.sh`。国际版额度接口不接受 COSY 会话令牌，程序会用 PAT 单独换取 OpenAPI 令牌（并自动刷新）后再查询余额；国内版账号则沿用原链路，无需额外配置。
+
+> ⚠️ **默认密码仅用于首次登录，请立即在「设置」标签页中修改**。登录失败会按客户端 IP 触发指数退避限流，部署到公网时务必启用 HTTPS 反代。
+
+### 2. 创建 API 密钥
+
+在「API 密钥」标签页中创建密钥（可自定义或自动生成），客户端使用此密钥调用 API。
+
+### 3. 调用 API
+
+```bash
+curl http://localhost:10081/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.8-Flash",
+    "messages": [{"role": "user", "content": "你好"}],
+    "stream": true
+  }'
+```
+
+### 4. 获取模型列表
+
+```bash
+curl http://localhost:10081/v1/models \
+  -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx"
+```
+
+### 4.1 多账号负载均衡与区域前缀
+
+池中有多个账号时，请求会按策略**分散到不同账号**，而不是全部压在一个账号上（单个账号的积分通常不会快速下降，只靠「积分阈值」很难触发切换，容易被上游限流）。策略在管理面板「账号 → 负载均衡 / 自动切换」中配置：
+
+| 策略 | 说明 |
+| ------ | ------ |
+| **粘性轮换**（默认） | 同一会话优先复用同一账号，连续使用达到「粘性次数」（默认 30）后切换到下一个账号——既保持上下文连续，又避免单账号被限流（10605）。 |
+| **纯轮询** | 每个请求轮换到下一个账号，最均匀。 |
+| **最少在途** | 优先选择当前在途请求最少的账号。 |
+
+- **低积分账号自动排除**：剩余积分 ≤ 阈值（默认 20）的账号停止接收新请求；全部账号都低于阈值时才继续使用。硬耗尽的账号冷却到下次重置点。
+- **失败转移**：请求撞上游 401/403 时，失败账号短暂冷却并排除，请求自动改投其它账号重试（单请求最多尝试「最大重试账号数」，默认 3 个），客户端无感。
+- **轮转探活**：后台每分钟探测一个账号的额度（按账号轮转），N 个账号最多 N 分钟全部刷新，上游调用恒为约 1 次/分钟。
+
+**用模型名前缀指定区域**（可选）：
+
+| 前缀 | 含义 |
+| ------ | ------ |
+| `cn/模型名` | 只走国内版账号（qoder.com.cn） |
+| `gl/模型名` 或 `global/模型名` | 只走国际版账号（qoder.sh） |
+| `auto/模型名` | 在国内 / 国际账号间智能分配 |
+| 不写前缀 | 默认走国内；池中没有国内账号时自动跨区 |
+
+```bash
+# 指定走国际版账号
+curl http://localhost:10081/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxxxxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gl/Qwen3.8-Flash","messages":[{"role":"user","content":"你好"}]}'
+```
+
+> 前缀只用于路由，不会传给上游；统计与日志按裸模型名聚合。
+
+### 4.2 每日签到
+
+账号页（「账号 → 每日签到」卡片）可为每个账号打开**自动签到**并设置签到时间；设置页的「签到配置」给出全局默认时间（默认 `10:15`，服务器本地时间）。也可在卡片上点「签到」立即执行一次。
+
+- **结果三态**：`success`（本次领到积分）/ `already`（今日已签）/ `skipped`（今天没有可签到活动）。真正的失败单独记为 `error`，并把原因写入 `last_checkin_msg`（悬停在「最近结果」上可见）。
+- **调度**：后台每分钟检查一次，到点后按账号 ID 抖动几秒，避免整池同时打接口。同一天已成功 / 已签 / 无活动的不再重试（`skipped` 属于有意不重试：活动未开放时反复请求没有意义）；失败的在 30 分钟内不重试，之后每轮检查都会再试一次（仍在当天内）。
+- **区域**：两区域的签到端点都使用 OpenAPI 令牌（`jt-`，自动换取并刷新）；遇到 401 会强制刷新后重试一次。
+- **设备指纹**：上游对机器头很敏感——携带一整套**派生**（非真实）机器头会被当作非官方客户端，「每天领 100 Credits」活动被静默过滤。因此程序只在能读到已安装 Qoder 桌面 App 的真实指纹时才发送六个机器头（Windows：`%LOCALAPPDATA%\Programs\Qoder[ CN]\resources\umid\runtime-info.exe`；macOS：`/Applications/Qoder[ CN].app/Contents/Resources/umid/runtime-info`）；读不到时一个机器头都不发，同样能领到每日积分。
+
+> 🕒 **时区**：签到时间按**服务器本地时间**解释，Docker 镜像默认 `TZ=Asia/Shanghai`。国际版账号若希望按本地「新的一天」签到，请把容器的 `TZ` 改成自己的时区。
+
+> ⚠️ **已知限制**：未安装 Qoder 桌面 App 的机器（典型是 Docker / Linux 服务器，目前没有 Linux 候选路径）拿不到真实指纹，此时签到不发送任何机器头，通用「每日领 100 Credits」活动可正常领取；仅设备定向活动是否受影响未验证。如需真实指纹，可用 `QODER_RUNTIME_INFO` 指向一个可执行 helper，其标准输出为 `{"machineToken":"…","machineType":"…","machineCode":"…"}`。
+
+### 5. 思考强度与参数透传（verbatim 原则）
+
+本桥接层对请求参数执行**完全原样转发**（verbatim）策略：客户端给什么就往网关送什么，不做本地校验、钳制、映射或静默替换；网关不接受时，错误按真实状态码与原文回传（见下文「错误回传」）。
+
+```json
+{
+  "model": "Qwen3.8-Max",
+  "messages": [{"role": "user", "content": "你好"}],
+  "reasoning_effort": "xhigh",
+  "max_tokens": 16000,
+  "temperature": 0.5
+}
+```
+
+参数处理一览：
+
+| 请求字段 | 处理 |
+| --- | --- |
+| `reasoning_effort` / `reasoning.effort` | 原样写入 `parameters.reasoning_effort`（顶层优先）。不校验档位、不映射 `minimal`、不因目录未声明而丢弃；模型不支持时由网关报错回传 |
+| `max_tokens` / `max_completion_tokens` | 任意 JSON 数値原样写入 `parameters.max_tokens`（含 0、负数、小数、超大值与超出 float64 精度的整数；`max_tokens` 优先）。未传时才用目录默认值 |
+| `max_thinking_tokens` | 客户端显式传入时原样转发（即使同时携带 `reasoning_effort: "none"`，也以客户端值为准）；仅 `none` 档且未传时才合成显式 `0`（官方客户端的天闭开关） |
+| `temperature` / `top_p` / `stop` / `seed` / `response_format` / `logit_bias` / `presence_penalty` / `frequency_penalty` / `n=1` | 原样写入 `parameters`。网关认不认由网关决定，错误回传 |
+| `n` ≠ 1 | 本地 `400`：响应通道结构上只能产生单个 choice，拒绝静默只返回一个 |
+| 类型错误（如 `"max_tokens": "8000"`、`"reasoning_effort": 3`） | 本地 `400 invalid_request_error` |
+| `stream_options.include_usage` | 流式响应仅在显式 `true` 时发送 usage 终帧（OpenAI 语义）；非流式始终携带 usage |
+
+#### `none` 档：完全关闭思考
+
+`reasoning_effort: "none"` 无条件转发（不再要求目录声明 `thinking_config.disabled`），并同时完成三件事（与官方客户端一致）：
+
+1. `parameters.reasoning_effort` 置为 `"none"`
+2. `parameters.max_thinking_tokens` 显式置为 `0`
+3. `model_config.is_reasoning` 与 `chat_context.extra.modelConfig.is_reasoning` 均置为 `false`
+
+其余档位不写 `max_thinking_tokens`；显式非 `none` 档位会强制 `is_reasoning=true`（覆盖目录默认），未传档位时才由目录决定。
+
+#### `is_reasoning` 与 `max_tokens` 的来源
+
+- `is_reasoning`：客户端显式档位优先（非 `none` → `true`，`none` → `false`）；未传时看目录（`thinking_config.enabled` 存在且非 null → 顶层 `is_reasoning` → 回退 `true`）。
+- `max_tokens`：仅当客户端未传时才用目录 `max_output_tokens`（缺失时 32000）。
+
+> **档位实效说明**：实测显示，除 `none` 外各档位字符串对 `reasoning_tokens` 的影响落在采样噪声内，不应据此期待精细的思考强度控制；但桥接层不再因此替网关做裁决，调用方发送的档位一律上船。
+
+**pi 客户端配置示例**：Qoder 上游不接受 OpenAI 的 `developer` 角色，而 pi 会用该角色承载代理指令；因此必须在 `~/.pi/agent/models.json` 的 `qoder-local` provider 上设置 `supportsDeveloperRole: false`，使 pi 改用 `system` 角色。为模型设置 `reasoning: true`，并将 pi 的档位映射到模型目录实际支持的值：
+
+```json
+{
+  "providers": {
+    "qoder-local": {
+      "compat": {
+        "supportsDeveloperRole": false
+      }
+    }
+  }
+}
+```
+
+以下模型配置适用于支持 `low` / `medium` / `xhigh` 的模型（桥接层不再过滤档位，`max` 映射仅是为了不发送无意义的无效值）：
+
+```json
+{
+  "id": "Qwen3.8-Max",
+  "reasoning": true,
+  "thinkingLevelMap": {
+    "off": "none",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "xhigh",
+    "xhigh": "xhigh",
+    "max": "xhigh"
+  }
+}
+```
+
+## API 端点
+
+| 端点 | 方法 | 说明 |
+| ------ | ------ | ------ |
+| `/v1/chat/completions` | POST | 聊天补全（兼容 OpenAI 格式） |
+| `/v1/models` | GET | 获取模型列表 |
+| `/admin` | GET | Web 管理面板 |
+| `/admin/api/login` | POST | 管理面板登录 |
+| `/admin/api/keys` | GET/POST/DELETE | API 密钥管理 |
+| `/admin/api/pat` | GET/POST | PAT 令牌管理（写入自动同步账号池） |
+| `/admin/api/accounts` | GET/POST/DELETE | 账号池管理（相同 PAT 重复提交视为切到该账号；删除激活中的账号会把激活顺延到第一个剩余账号，账号不存在才返回 `404`） |
+| `/admin/api/accounts/switch` | POST | 手动切换激活账号 |
+| `/admin/api/accounts/note` | POST | 修改账号备注 |
+| `/admin/api/accounts/weight` | POST | 设置账号权重（1..100，按权重分配请求） |
+| `/admin/api/accounts/checkin` | POST | 立即执行一次该账号的每日签到 |
+| `/admin/api/accounts/checkin-setting` | POST | 账号的自动签到开关与签到时间（`""` = 用全局默认） |
+| `/admin/api/accounts/check` | POST | 检测账号真实额度（临时会话查询一次并落快照） |
+| `/admin/api/accounts/auto` | GET/POST | 负载均衡 / 自动切换设置（开关 + 策略 + 粘性次数 + 最大重试账号数 + 剩余积分阈值） |
+| `/admin/api/models` | GET | 获取模型列表 |
+| `/admin/api/stats` | GET | 请求统计（总量 / 按模型 / 近 24 小时趋势 / token 用量 / 实际扣费额度与均值 / 计费周期与套餐信息） |
+| `/admin/api/config` | GET/POST | 服务器配置 |
+| `/admin/api/password` | POST | 修改管理密码 |
+
+**错误响应约定**：登录失败限流返回 `429`（附 `Retry-After`）；创建重复 API Key 返回 `409`；端口配置越界（非 1–65535）返回 `400`；未鉴权或会话过期返回 `401`。
+
+**上游错误回传**：网关对请求本身的拒绝（如不支持的档位、`max_tokens` 范围校验失败）按真实状态码回传——4xx 请求级拒绝 → `400 invalid_request_error` + 网关原始 message；429 → `429 rate_limit_error`（上游携带 `Retry-After` 时一并透传）；5xx → `502 upstream_error`。流式与非流式一视同仁：只要尚未向客户端写出任何内容，拒绝就以真实状态码的 JSON 错误体返回；内容已开始输出后才失败的，则以 SSE error chunk 携带真实原因（此时状态码只能保持 200）。网关在流内报错（HTTP 200 但错误帧）时，若尚无内容，同样按错误帧内嵌的状态码映射（无状态码则 `502`）。上游会话/PAT 凭证被拒（网关 401/403）回传 `502 upstream_error`（上游凭证问题不是客户端的 API key 问题，不回传 401 以免误导）。参数类型错误（字符串数值等）与 `n`≠1 在本地返回 `400`。
+
+## 额度与计费周期
+
+管理面板使用 Qoder 官方客户端同源的额度接口，展示当前计费周期的权威用量，而不是仅统计本服务启动后的局部消耗：
+
+```text
+套餐额度      2,939 / 3,000   剩余 61      可用
+加购额度      0 / 1,000       剩余 1,000   可用
+组织资源包    120 / 4,000     剩余 3,880   可用
+合计剩余      4,941 · 09-25 重置
+```
+
+> **合计口径**：`合计剩余` 只累加可消费的额度——标记为「不可用」的池子（如组织资源包的 `available=false`）虽仍会单独成行展示，但不计入合计，否则汇总数字会与紧上方那一行的「不可用」自相矛盾。
+
+> 免费账号的套餐池为 `userQuota.total = 0`（套餐本身不含额度），此时面板首行直接展示真正持有额度的池子（通常是加购额度），而不是渲染成「套餐 0 / 0 · 已用尽」。`total`/`cap` 为 0 的池子视为不存在，不会出现在额度明细卡中。
+
+### 数据来源
+
+主数据来自 `GET https://openapi.qoder.com.cn/api/v2/quota/usage`，使用现有 jobToken 交换返回的 `securityOauthToken` 作为 Bearer。该接口与官方客户端 `/usage` 面板相同，提供：
+
+| 字段 | 含义 | 用途 |
+| ------ | ------ | ------ |
+| `userQuota.total/used/remaining` | 套餐总额、已用及剩余 Credits | 面板额度行（`total = 0` 时该池不参与展示） |
+| `userQuota.percentage` | 套餐使用比例 | 管理 API 输出及详细信息 |
+| `addOnQuota` | 加购额度包（存在时） | 管理 API 输出及额度明细卡 |
+| `orgResourcePackage` | 组织资源包容量、已用、剩余及可用状态 | 管理 API 输出及额度明细卡 |
+| `expiresAt` | 当前额度周期结束时刻（仅兜底） | 重置日期与倒计时 |
+| `isQuotaExceeded` | 官方客户端采用的超额判定 | 面板红色告警徽标 |
+
+网关 `POST /algo/api/v3/user/status?Encode=1` 仍负责提供 `plan`、`userTag`、组织名称和真实 `userType`。它的 `quota: 0` 是精简字段，**不能解释为套餐没有数字上限**；额度必须以 OpenAPI 的 `userQuota` 为准。
+
+### 统计与降级口径
+
+- **官方额度优先**：面板的套餐用量来自账号级 OpenAPI，包含 IDE、CLI 和本服务产生的全部消耗，也能覆盖服务启动前的当期用量。
+- **额度来源分别展示**：套餐额度、加购额度和组织资源包在额度明细卡中分别成行展示，并汇总各额度来源返回的剩余 Credits；组织资源包的“可用/不可用”状态以 OpenAPI 返回值为准。
+- **本服务实际消耗单独成卡**：官方额度池是账号级数字，无法回答“本服务花了多少”。统计页的「实际消耗 Credits」卡直接累加网关 usage 帧里的 `credits`（实际扣费额度，已含折扣），因此可核对到每一次请求：
+
+  | 字段 | 含义 |
+  | ------ | ------ |
+  | `credits` | 本服务历史累计实际扣费 |
+  | `cycle_credits` | 本订阅周期内的实际扣费（有周期边界时卡片展示此项） |
+  | `billed_requests` | 实际计费的请求数（仅 `billable=true` 的 usage 帧） |
+  | `avg_credits` | `credits / billed_requests`，平均每次请求的实际花费 |
+
+  > **分母为什么不是请求总数**：`total` 含失败请求、`billable=false` 的免费帧，以及流中断未收到 usage 帧的请求，用它作分母会低估均值。`billed_requests` 只统计真正扣费的帧，均值才等于「每次计费请求的均价」。
+
+  > **按模型 / 按小时归因**：`by_model[].credits` 与 `hourly[].credits` 把消耗归到具体模型与时段，行内的 `avg_credits` 给出该行的均价（按该行 `billed` 计）；模型表的「消耗 / 平均」列与趋势图 tooltip 均取此口径。该模型未产生计费请求时「平均」列显示 `—` 而非 `0`，避免把「未计费」误读为「免费」。
+
+- **升级说明**：`billed_requests` 自本版起累计，旧 `data.json` 中没有该字段时，卡片副行会提示「计费次数与均值自本版起统计」，而不是在非零的累计值下方报「暂无计费请求」；已累计的 `credits` 与历史周期数据不受影响。
+- **本地累计仅作降级**：usage 帧中 `billable=false` 的请求仍计入 token，但不计入本地 credits；OpenAPI 从未成功时，面板才显示本服务观察到的周期消耗，并明确标注口径。
+- **周期边界权威同步**：重置时刻以网关 `/user/status` 的 `nextResetAt` 为权威，OpenAPI `expiresAt` 仅在其缺失时兜底；且 `expiresAt` 必须小于 `2100-01-01` 才会被采纳——无期限套餐会把它填成 `9999-12-31` 哨兵值，该值会被忽略。本地周期起点按自然月回退推导（月末会夹取到目标月最后一天，3/31 → 2/28），断网期间仍可完成一次性滚动。
+- **边界变更的接受规则**（防止累计值被抖动或陈旧缓存误清）：首次拿到边界时**保留**已累计的 credits；边界**未向前推进**（`/user/status` 缓存 1 小时，可能上报已滚过的旧值）则直接忽略；前进幅度小于 7 天时视为同一周期，不清零；达到 7 天以上才判定为真实续期并清零上一周期。
+- **累计值仍保留**：`stats.credits` 保存本服务历史累计扣费，鼠标悬停在额度行可查看。
+
+### 刷新时机
+
+主程序启动后立即获取一次额度，此后每分钟在后台刷新。管理面板的 15 秒轮询完全读取内存和持久化快照，不直接调用上游；临时网络故障会保留最后一次成功结果。
+
+### `userType` 修复
+
+`jobToken` 响应中**不含** `userType` 字段，此前 bridge 一律回退为 `personal_standard`，导致团队账号的签名会话载荷层级错误。现改为在构建会话**之前**从 `/user/status` 取真实层级（该值被 AES 签入 bearer 载荷，事后无法修改）。状态接口临时不可用时，按「上次已知层级 → 空值 → 历史默认值」顺序降级，避免续期时把团队账号静默降级。
+
+## 安全
+
+本项目面向内网 / 个人使用，已内置以下加固措施，**部署到公网前请务必修改默认密码并使用 HTTPS 反代**：
+
+- **HTTP 超时**：`ReadHeaderTimeout=10s`、`IdleTimeout=120s`，抵御 slowloris 类慢速连接耗尽；`WriteTimeout` 不设以兼容长连接 SSE 流式响应，流内超过 5 分钟无数据（空闲）自动断开，防止网关连接卡死。
+- **请求体上限**：`/v1/chat/completions` 限制 10 MiB，管理 API 限制 64 KiB，防止超大 payload 耗尽内存。
+- **登录限流**：管理面板登录按客户端 IP 计数，失败后指数退避（1s → 30s 封顶），锁定期间返回 `429` + `Retry-After`。
+- **恒定时间比较**：API Key 校验与管理密码比对均使用 `crypto/subtle`，避免时序侧信道泄露。
+- **Cookie 安全**：会话 Cookie 为 `HttpOnly` + `SameSite=Lax`，在 HTTPS（含 `X-Forwarded-Proto: https` 反代）下自动附加 `Secure`。
+- **优雅关闭**：收到 `SIGINT`/`SIGTERM` 后停止接受新连接、等待在途请求（最长 15s）并完成统计最终落盘，避免数据丢失。
+- **XSS 防护**：Web 面板用户输入通过 `textContent` 渲染与 `addEventListener` 绑定，避免内联事件处理器中的字符串注入。
+- **输入校验**：API Key 唯一性校验（重复返回 `409`）；端口范围校验 1–65535；工具调用索引边界保护（防 panic / OOM）。
+
+## 项目结构
+
+```
+Qoder-2API-Go/
+├── main.go              # 程序入口（请求模板内联在 bridge 包中）
+├── auth/                # 认证模块
+├── bridge/              # API 桥接模块
+├── models/              # 模型管理
+├── store/               # 数据持久化
+├── transform/           # 数据转换
+├── admin/               # Web 管理面板
+├── scripts/             # 运维脚本（macOS launchd 服务管理）
+├── Dockerfile           # Docker 构建文件
+├── docker-compose.yaml  # Docker Compose 配置
+└── .github/workflows/   # GitHub Actions 自动构建
+```
+
+## 技术栈
+
+- **语言**：Go 1.22+
+- **依赖**：仅使用 `github.com/google/uuid`，其余全部标准库
+- **加密**：RSA + AES 混合加密、MD5 签名、自定义 Base64 编码
+- **HTTP**：标准库 `net/http`，SSE 流式响应，优雅关闭
+- **存储**：JSON 文件持久化，线程安全读写
+- **安全**：请求体上限、登录限流、恒定时间鉴权、Secure Cookie、XSS 防护
+
+## 开发
+
+```bash
+# 克隆仓库
+git clone https://github.com/EchoPing07/Qoder-2API-Go.git
+cd Qoder-2API-Go
+
+# 运行测试
+go test ./...
+
+# 构建
+go build -o qoder2api .
+
+# 构建（跨平台）
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o qoder2api-linux-arm64 .
+```
+
+## 参与开发
+
+欢迎 PR。要求：**一个 PR 只做一件事，描述与代码一致，没验证过的如实说明。**
+
+**提交前自查**
+
+- [ ] `go build ./...`、`go vet ./...`、`go test ./...` 全绿，`gofmt -l .` 无输出（Windows 下 `core.autocrlf=true` 会因 CRLF 误报，可用 `git -c core.autocrlf=input gofmt -l .` 复核）
+- [ ] diff 只含描述里提到的改动：无顺手修的 typo、无关重构、整体格式化、CRLF 翻转
+- [ ] 描述里每一句「已实现 / 已修复」都能在 diff 里指到对应行
+- [ ] 自己实际跑过改动涉及的接口；只做了静态阅读就写明「未实机验证」
+- [ ] 没有提交二进制、`data.json`、`probe/`、日志或任何密钥
+
+**分支**：从最新 `main` 拉 `git switch -c fix/xxx origin/main`；合并前 rebase 到最新 `main` 并自行解决冲突。提交信息用 `feat:` / `fix:` / `docs:` / `refactor:` 前缀。
+
+**标题**：写实际改动，不写「优化」「修复若干问题」「update」，也不写与内容不符的夸大标题。
+
+**描述**按此模板，缺项需补全：
+
+```md
+## 改了什么
+## 为什么改（修 Bug 必写根因）
+## 对用户/开发者的影响（兼容性、配置/接口/返回值变化、README 是否同步）
+## 验证方式（构建与测试结果、手动验证的命令与响应、是否真机部署过）
+## 未验证 / 已知限制
+```
+
+没在真机 / 生产环境跑过，请照实写进最后一节。本项目测试覆盖不完善，条件允许时应实际部署并做一轮基本验证。
+
+**AI 辅助开发（vibe coding）**
+
+- 请用你手上能力较好的模型，至少不能太差
+- 自己通读 diff，清楚每处改动的原因
+- 不要让 AI 顺手优化、统一风格、补防御性检查
+- 不要编造验证结果或上游行为；涉及网关字段 / 状态码 / 错误文案，给出实际抓到的脱敏请求响应
+- AI 给出「加兜底」式修补时，先想清根因再决定是否接受
+
+**代码要求**：改动尽可能小，3 行能解决就不要改 30 行；简洁但不牺牲可读性；注释写「为什么」而不是「做了什么」，上游协议的反直觉处理和魔法常量必须注释；行为变更同步更新 README；日志不打印 PAT、API Key、完整响应体或对话内容。
+
+## 许可证
+
+本项目基于 [MIT License](./LICENSE) 开源。
+
+## 免责声明
+
+本项目仅供学习和研究目的使用。
+
+1. **本项目不隶属于 Qoder 或其关联公司**，Qoder 是其各自所有者的商标。本项目不对任何官方服务提供保证或支持。
+2. **仅供学习交流使用**，不得用于任何商业用途或非法用途。使用者应遵守所在地区的法律法规。
+3. **本项目不对任何因使用或滥用本项目而导致的直接或间接损失负责**，包括但不限于数据丢失、服务中断、账号封禁等情况。
+4. **使用者需自行承担使用本项目的所有风险**，项目维护者不对本项目的正确性、完整性、可靠性或适用性作任何明示或暗示的保证。
+5. **请勿将本项目用于绕付费、绕限制、大规模爬取或其他可能损害服务提供方利益的行为**。请尊重服务提供方的条款和条件。
+6. 如果本项目的任何内容侵犯了您的权益，请及时联系项目维护者，我们将积极配合处理。
+
+使用本项目即表示您已阅读并同意以上免责声明。如果您不同意，请立即停止使用并删除本项目。

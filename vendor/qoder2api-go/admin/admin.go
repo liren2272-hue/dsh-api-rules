@@ -1,0 +1,1255 @@
+// Package admin provides WebUI management for the API bridge:
+// PAT configuration, API key CRUD, model listing, and password-protected access.
+package admin
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"qoder2api/auth"
+	"qoder2api/logs"
+	"qoder2api/models"
+	"qoder2api/stats"
+	"qoder2api/store"
+)
+
+// Local single-operator panel: a month-long session reads as "remember me" so
+// the operator is not re-prompted after every gateway restart.
+const sessionDuration = 30 * 24 * time.Hour
+
+// adminMaxBody caps JSON request bodies handled by the admin API.
+const adminMaxBody = 1 << 16 // 64 KiB
+
+// AccountChecker probes one PAT's real allowance through a throwaway bridge
+// (full session bootstrap) and returns the quota snapshot. The region selects
+// the Qoder deployment (""/"cn" = China, "global" = international).
+// Implemented by the caller (main package) — the admin package stays free of
+// bridge wiring.
+type AccountChecker func(ctx context.Context, pat, region string) (*store.AccountSnapshot, error)
+
+// AccountRuntime reports an account's live state for the panel: in-flight
+// requests, the per-account capacity, and the cumulative request count since
+// the process started. May be nil.
+type AccountRuntime func(accountID string) (inFlight, capacity int, requests int64)
+
+// AccountCheckiner runs a single daily check-in for one account and returns the
+// result. Implemented by the caller (main package) so admin stays free of
+// bridge wiring. May be nil.
+type AccountCheckiner func(ctx context.Context, accountID string) (auth.CheckinResult, error)
+
+// Admin manages the web UI and admin API endpoints.
+type Admin struct {
+	store            *store.Store
+	modelFetcher     ModelFetcher
+	stats            *stats.Recorder
+	logRec           *logs.Recorder
+	accountChecker   AccountChecker
+	accountRuntime   AccountRuntime
+	accountCheckiner AccountCheckiner
+	sessions         map[string]time.Time
+	sessionMu        sync.Mutex
+	sessionFilePath  string
+	limiter          *loginLimiter
+}
+
+// ModelFetcher returns the current model catalog (dynamic or fallback).
+type ModelFetcher func(ctx context.Context) []string
+
+// New creates an Admin instance. rec and lr may be nil.
+func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder, lr *logs.Recorder) *Admin {
+	a := &Admin{
+		store:        s,
+		modelFetcher: mf,
+		stats:        rec,
+		logRec:       lr,
+		sessions:     make(map[string]time.Time),
+		limiter:      newLoginLimiter(),
+	}
+	if p := s.FilePath(); p != "" {
+		a.sessionFilePath = filepath.Join(filepath.Dir(p), "sessions.json")
+		a.loadSessions()
+	}
+	return a
+}
+
+// loadSessions reads persisted sessions from disk so a gateway restart does not
+// force the operator to re-enter the panel password. Best-effort: a missing or
+// corrupt file just yields an empty session set.
+func (a *Admin) loadSessions() {
+	if a.sessionFilePath == "" {
+		return
+	}
+	data, err := os.ReadFile(a.sessionFilePath)
+	if err != nil {
+		return
+	}
+	var persisted map[string]time.Time
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return
+	}
+	now := time.Now()
+	a.sessionMu.Lock()
+	for token, exp := range persisted {
+		if now.Before(exp) {
+			a.sessions[token] = exp
+		}
+	}
+	a.sessionMu.Unlock()
+}
+
+// persistSessionsLocked writes the current session map to disk. Callers must
+// hold a.sessionMu. Failures are swallowed: persistence is a convenience, and a
+// read-only data dir must not break login.
+func (a *Admin) persistSessionsLocked() {
+	if a.sessionFilePath == "" {
+		return
+	}
+	data, err := json.Marshal(a.sessions)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(a.sessionFilePath, data, 0o600)
+}
+
+// SetAccountChecker installs the account quota probe used by
+// /admin/api/accounts/check. Wiring happens before the server starts serving.
+func (a *Admin) SetAccountChecker(fn AccountChecker) {
+	a.accountChecker = fn
+}
+
+// SetAccountRuntime installs the per-account concurrency reporter used by the
+// account list. Wiring happens before the server starts serving.
+func (a *Admin) SetAccountRuntime(fn AccountRuntime) {
+	a.accountRuntime = fn
+}
+
+// SetAccountCheckiner installs the per-account daily check-in runner used by
+// the manual check-in endpoint. Wiring happens before the server starts serving.
+func (a *Admin) SetAccountCheckiner(fn AccountCheckiner) {
+	a.accountCheckiner = fn
+}
+
+// RegisterRoutes registers all admin API routes on the given mux.
+//
+// The WebUI itself is served by the web package (pages under /admin, assets
+// under /admin/assets/); this mux section only owns the JSON API under
+// /admin/api/*.
+func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
+	// Auth endpoints (no auth required)
+	mux.HandleFunc("/admin/api/login", a.handleLogin)
+	mux.HandleFunc("/admin/api/logout", a.handleLogout)
+	mux.HandleFunc("/admin/api/auth", a.handleAuth)
+
+	// Protected API endpoints (require auth)
+	mux.HandleFunc("/admin/api/keys", a.requireAuth(a.handleKeys))
+	mux.HandleFunc("/admin/api/pat", a.requireAuth(a.handlePAT))
+	mux.HandleFunc("/admin/api/accounts", a.requireAuth(a.handleAccounts))
+	mux.HandleFunc("/admin/api/accounts/switch", a.requireAuth(a.handleAccountSwitch))
+	mux.HandleFunc("/admin/api/accounts/note", a.requireAuth(a.handleAccountNote))
+	mux.HandleFunc("/admin/api/accounts/weight", a.requireAuth(a.handleAccountWeight))
+	mux.HandleFunc("/admin/api/accounts/check", a.requireAuth(a.handleAccountCheck))
+	mux.HandleFunc("/admin/api/accounts/checkin", a.requireAuth(a.handleAccountCheckin))
+	mux.HandleFunc("/admin/api/accounts/checkin-setting", a.requireAuth(a.handleAccountCheckinSetting))
+	mux.HandleFunc("/admin/api/accounts/auto", a.requireAuth(a.handleAutoSwitch))
+	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
+	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
+	mux.HandleFunc("/admin/api/logs", a.requireAuth(a.handleLogs))
+	mux.HandleFunc("/admin/api/config", a.requireAuth(a.handleConfig))
+	mux.HandleFunc("/admin/api/password", a.requireAuth(a.handlePassword))
+}
+
+// --- Session & Auth ---
+
+func generateSessionToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (a *Admin) createSession() (string, error) {
+	token, err := generateSessionToken()
+	if err != nil {
+		return "", err
+	}
+	a.sessionMu.Lock()
+	a.sessions[token] = time.Now().Add(sessionDuration)
+	// Opportunistic cleanup: remove expired sessions
+	now := time.Now()
+	for k, exp := range a.sessions {
+		if now.After(exp) {
+			delete(a.sessions, k)
+		}
+	}
+	a.persistSessionsLocked()
+	a.sessionMu.Unlock()
+	return token, nil
+}
+
+func (a *Admin) isValidSession(token string) bool {
+	if token == "" {
+		return false
+	}
+	a.sessionMu.Lock()
+	defer a.sessionMu.Unlock()
+	expiry, ok := a.sessions[token]
+	if !ok || time.Now().After(expiry) {
+		delete(a.sessions, token)
+		a.persistSessionsLocked()
+		return false
+	}
+	return true
+}
+
+func (a *Admin) removeSession(token string) {
+	a.sessionMu.Lock()
+	delete(a.sessions, token)
+	a.persistSessionsLocked()
+	a.sessionMu.Unlock()
+}
+
+func (a *Admin) getPassword() string {
+	if env := os.Getenv("QODER_ADMIN_PASSWORD"); env != "" {
+		return env
+	}
+	return a.store.GetPassword()
+}
+
+// --- Login rate limiting (per client IP, exponential backoff) ---
+
+type loginAttempt struct {
+	failures    int
+	lockedUntil time.Time
+	lastFail    time.Time
+}
+
+type loginLimiter struct {
+	mu    sync.Mutex
+	state map[string]*loginAttempt
+}
+
+const (
+	loginMaxBackoff = 30 * time.Second
+	loginPruneAge   = time.Hour
+)
+
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{state: make(map[string]*loginAttempt)}
+}
+
+// check reports whether the IP is currently locked out and, if so, how long
+// until it may retry.
+func (l *loginLimiter) check(ip string) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.pruneLocked()
+	st := l.state[ip]
+	if st == nil {
+		return false, 0
+	}
+	now := time.Now()
+	if now.Before(st.lockedUntil) {
+		return true, st.lockedUntil.Sub(now)
+	}
+	return false, 0
+}
+
+func (l *loginLimiter) fail(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st := l.state[ip]
+	if st == nil {
+		st = &loginAttempt{}
+		l.state[ip] = st
+	}
+	st.failures++
+	st.lastFail = time.Now()
+	// Compute the backoff in plain integers and clamp before converting to
+	// time.Duration: 1<<63 seconds overflows int64 nanoseconds and yields a
+	// negative duration, which would silently disable the lockout after
+	// enough consecutive failures.
+	shift := st.failures - 1
+	if shift > 5 { // 1<<5 s == 32s > loginMaxBackoff
+		shift = 5
+	}
+	backoff := time.Second << uint(shift)
+	if backoff > loginMaxBackoff {
+		backoff = loginMaxBackoff
+	}
+	st.lockedUntil = st.lastFail.Add(backoff)
+}
+
+func (l *loginLimiter) success(ip string) {
+	l.mu.Lock()
+	delete(l.state, ip)
+	l.mu.Unlock()
+}
+
+func (l *loginLimiter) pruneLocked() {
+	cutoff := time.Now().Add(-loginPruneAge)
+	for ip, st := range l.state {
+		if st.lastFail.Before(cutoff) {
+			delete(l.state, ip)
+		}
+	}
+}
+
+// --- Request helpers ---
+
+// readJSON decodes a JSON request body capped at adminMaxBody. The size cap
+// bounds memory use against oversized payloads.
+func readJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
+	r.Body = http.MaxBytesReader(w, r.Body, adminMaxBody)
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
+// passwordsEqual compares two secrets in constant time to avoid timing leaks.
+func passwordsEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func clientIP(r *http.Request) string {
+	host := r.RemoteAddr
+	// Trim the port, handling both "1.2.3.4:5678" and "[::1]:5678".
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return host
+}
+
+func isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if xfp := r.Header.Get("X-Forwarded-Proto"); xfp == "https" {
+		return true
+	}
+	return false
+}
+
+func setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "admin_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isHTTPS(r),
+		MaxAge:   int(sessionDuration.Seconds()),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "admin_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isHTTPS(r),
+		MaxAge:   -1,
+	})
+}
+
+// requireAuth wraps a handler with session authentication.
+func (a *Admin) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 本地单机面板鉴权开关：默认关闭管理员登录界面。
+		// 设 QODER_DISABLE_PANEL_AUTH=0 可恢复登录鉴权。
+		if os.Getenv("QODER_DISABLE_PANEL_AUTH") != "0" {
+			next(w, r)
+			return
+		}
+		cookie, err := r.Cookie("admin_session")
+		if err != nil || !a.isValidSession(cookie.Value) {
+			writeJSONError(w, 401, "未登录或会话已过期")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (a *Admin) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	ip := clientIP(r)
+	if locked, retry := a.limiter.check(ip); locked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		writeJSONError(w, 429, "登录尝试过于频繁，请稍后再试")
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if !passwordsEqual(body.Password, a.getPassword()) {
+		a.limiter.fail(ip)
+		writeJSONError(w, 401, "密码错误")
+		return
+	}
+	a.limiter.success(ip)
+	token, err := a.createSession()
+	if err != nil {
+		writeJSONError(w, 500, "无法创建会话")
+		return
+	}
+	setSessionCookie(w, r, token)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (a *Admin) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	if cookie, err := r.Cookie("admin_session"); err == nil {
+		a.removeSession(cookie.Value)
+	}
+	clearSessionCookie(w, r)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (a *Admin) handleAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	if os.Getenv("QODER_DISABLE_PANEL_AUTH") != "0" {
+		writeJSON(w, 200, map[string]interface{}{"authenticated": true})
+		return
+	}
+	cookie, err := r.Cookie("admin_session")
+	authed := err == nil && a.isValidSession(cookie.Value)
+	writeJSON(w, 200, map[string]interface{}{"authenticated": authed})
+}
+
+func (a *Admin) handlePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if os.Getenv("QODER_ADMIN_PASSWORD") != "" {
+		writeJSONError(w, 400, "密码由环境变量 QODER_ADMIN_PASSWORD 管理，无法在面板中修改")
+		return
+	}
+	if !passwordsEqual(body.CurrentPassword, a.getPassword()) {
+		writeJSONError(w, 401, "当前密码错误")
+		return
+	}
+	if len(body.NewPassword) < 1 {
+		writeJSONError(w, 400, "新密码不能为空")
+		return
+	}
+	if err := a.store.SetPassword(body.NewPassword); err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	// Invalidate every existing session so a (possibly stolen) cookie from
+	// before the password change cannot be replayed.
+	a.sessionMu.Lock()
+	a.sessions = make(map[string]time.Time)
+	a.sessionMu.Unlock()
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// --- HTTP Helpers ---
+
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// --- API Key endpoints ---
+
+func (a *Admin) handleKeys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		keys := a.store.ListKeys()
+		writeJSON(w, 200, map[string]interface{}{"keys": keys})
+	case http.MethodPost:
+		var body struct {
+			Key  string `json:"key"`
+			Note string `json:"note"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		entry, err := a.store.AddKey(body.Key, body.Note)
+		if err != nil {
+			if errors.Is(err, store.ErrDuplicateKey) {
+				writeJSONError(w, 409, err.Error())
+			} else {
+				writeJSONError(w, 500, err.Error())
+			}
+			return
+		}
+		writeJSON(w, 201, entry)
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeJSONError(w, 400, "缺少 id 参数")
+			return
+		}
+		if err := a.store.DeleteKey(id); err != nil {
+			writeJSONError(w, 404, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "deleted"})
+	default:
+		writeJSONError(w, 405, "方法不允许")
+	}
+}
+
+// --- Config endpoint ---
+
+// timeoutEnvManaged reports whether stream timeouts are pinned by env vars,
+// in which case the panel must not override them (same policy as
+// QODER_ADMIN_PASSWORD for password changes).
+func timeoutEnvManaged() bool {
+	return os.Getenv("QODER_CHAT_TIMEOUT_SECONDS") != "" ||
+		os.Getenv("QODER_IDLE_TIMEOUT_SECONDS") != ""
+}
+
+// logLimitsEnvManaged reports whether the log limits are pinned by env vars,
+// in which case the panel must not change them (same policy as the timeouts).
+func logLimitsEnvManaged() bool {
+	return os.Getenv("QODER_LOG_RETENTION_DAYS") != "" ||
+		os.Getenv("QODER_LOG_MAX_ENTRIES") != ""
+}
+
+// corsSettings returns the effective CORS policy shown in the panel. The env
+// var wins when present, mirroring the startup precedence of the other
+// overrides; envManaged tells the UI to lock the fields. An override that cannot
+// match anything is reported as "not managed" rather than as an active policy
+// with a blank origin list, which would contradict the request path.
+func (a *Admin) corsSettings() (enabled bool, origins string, envManaged bool) {
+	if env := store.UsableCORSSpec(os.Getenv("QODER_CORS_ORIGINS")); env != "" {
+		return true, env, true
+	}
+	enabled, origins = a.store.GetCORS()
+	return enabled, origins, false
+}
+
+func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// Report effective values, not the persisted file values: env startup
+		// overrides are already folded into the stream timeouts and into the
+		// log limits held by the recorder.
+		timeouts := auth.CurrentStreamTimeouts()
+		retentionDays, maxEntries := a.store.GetLogRetentionDays(), a.store.GetLogMaxEntries()
+		if a.logRec != nil {
+			retentionDays, maxEntries = a.logRec.Limits()
+		}
+		corsEnabled, corsOrigins, corsEnvManaged := a.corsSettings()
+		writeJSON(w, 200, map[string]interface{}{
+			"host":                 a.store.GetHost(),
+			"port":                 a.store.GetPort(),
+			"chat_timeout_seconds": int(timeouts.Header.Seconds()),
+			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
+			"log_retention_days":   retentionDays,
+			"log_max_entries":      maxEntries,
+			"checkin_time":         a.store.GetCheckinTime(),
+			"cors_enabled":         corsEnabled,
+			"cors_origins":         corsOrigins,
+			"cors_env_managed":     corsEnvManaged,
+		})
+	case http.MethodPost:
+		var body struct {
+			Host               string `json:"host"`
+			Port               int    `json:"port"`
+			ChatTimeoutSeconds int    `json:"chat_timeout_seconds"`
+			IdleTimeoutSeconds int    `json:"idle_timeout_seconds"`
+			LogRetentionDays   int    `json:"log_retention_days"`
+			LogMaxEntries      int    `json:"log_max_entries"`
+			CheckinTime        string `json:"checkin_time"`
+			// Pointers distinguish "not sent" from an intentional false/empty.
+			CORSEnabled *bool   `json:"cors_enabled"`
+			CORSOrigins *string `json:"cors_origins"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		if body.Host == "" {
+			body.Host = store.DefaultHost
+		}
+		if body.Port == 0 {
+			body.Port = store.DefaultPort
+		}
+		if body.Port < 1 || body.Port > 65535 {
+			writeJSONError(w, 400, "端口必须在 1-65535 范围内")
+			return
+		}
+		// Timeout fields are optional (0 = keep current) so legacy callers
+		// that only send host/port keep working. Validate everything before
+		// saving anything so a bad value cannot leave a partial update.
+		wantsTimeouts := body.ChatTimeoutSeconds != 0 || body.IdleTimeoutSeconds != 0
+		if wantsTimeouts && timeoutEnvManaged() {
+			writeJSONError(w, 400, "超时由环境变量 QODER_CHAT_TIMEOUT_SECONDS / QODER_IDLE_TIMEOUT_SECONDS 管理，无法在面板中修改")
+			return
+		}
+		if body.ChatTimeoutSeconds != 0 {
+			if err := store.ValidateTimeoutSeconds(body.ChatTimeoutSeconds, store.MaxChatTimeoutSeconds); err != nil {
+				writeJSONError(w, 400, "Chat 响应超时："+err.Error())
+				return
+			}
+		}
+		if body.IdleTimeoutSeconds != 0 {
+			if err := store.ValidateTimeoutSeconds(body.IdleTimeoutSeconds, store.MaxIdleTimeoutSeconds); err != nil {
+				writeJSONError(w, 400, "流空闲超时："+err.Error())
+				return
+			}
+		}
+		// Log limits share the timeout convention: 0 = keep current, and a
+		// value pinned by env vars is rejected.
+		wantsLogLimits := body.LogRetentionDays != 0 || body.LogMaxEntries != 0
+		if wantsLogLimits && logLimitsEnvManaged() {
+			writeJSONError(w, 400, "日志配置由环境变量 QODER_LOG_RETENTION_DAYS / QODER_LOG_MAX_ENTRIES 管理，无法在面板中修改")
+			return
+		}
+		if body.LogRetentionDays != 0 {
+			if err := store.ValidateLogRetentionDays(body.LogRetentionDays); err != nil {
+				writeJSONError(w, 400, "日志保留天数："+err.Error())
+				return
+			}
+		}
+		if body.LogMaxEntries != 0 {
+			if err := store.ValidateLogMaxEntries(body.LogMaxEntries); err != nil {
+				writeJSONError(w, 400, "日志条数上限："+err.Error())
+				return
+			}
+		}
+		// Check-in time is optional (empty = keep current). Validate before saving
+		// anything so a bad value cannot leave a partial update.
+		wantsCheckinTime := strings.TrimSpace(body.CheckinTime) != ""
+		if wantsCheckinTime {
+			if err := store.ValidateCheckinTime(body.CheckinTime); err != nil {
+				writeJSONError(w, 400, "签到时间："+err.Error())
+				return
+			}
+		}
+		// CORS fields are optional as well. The origin list is only validated when
+		// the policy ends up enabled: a data.json holding a value that no longer
+		// validates must still be switchable off, otherwise the panel (which
+		// resends every field) could never save anything again.
+		wantsCORS := body.CORSEnabled != nil || body.CORSOrigins != nil
+		if wantsCORS && store.UsableCORSSpec(os.Getenv("QODER_CORS_ORIGINS")) != "" {
+			writeJSONError(w, 400, "跨域配置由环境变量 QODER_CORS_ORIGINS 管理，无法在面板中修改")
+			return
+		}
+		corsEnabled, corsOrigins := a.store.GetCORS()
+		if body.CORSEnabled != nil {
+			corsEnabled = *body.CORSEnabled
+		}
+		if body.CORSOrigins != nil {
+			corsOrigins = strings.TrimSpace(*body.CORSOrigins)
+		}
+		if corsEnabled {
+			if err := store.ValidateCORSOrigins(corsOrigins); err != nil {
+				writeJSONError(w, 400, "跨域来源："+err.Error())
+				return
+			}
+			if corsOrigins == "" {
+				writeJSONError(w, 400, "启用跨域时必须填写允许的来源")
+				return
+			}
+		}
+		if err := a.store.SetHostPort(body.Host, body.Port); err != nil {
+			writeJSONError(w, 500, err.Error())
+			return
+		}
+		if body.ChatTimeoutSeconds != 0 {
+			if err := a.store.SetChatTimeoutSeconds(body.ChatTimeoutSeconds); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		if body.IdleTimeoutSeconds != 0 {
+			if err := a.store.SetIdleTimeoutSeconds(body.IdleTimeoutSeconds); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		if body.LogRetentionDays != 0 {
+			if err := a.store.SetLogRetentionDays(body.LogRetentionDays); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		if body.LogMaxEntries != 0 {
+			if err := a.store.SetLogMaxEntries(body.LogMaxEntries); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		if wantsCheckinTime {
+			if err := a.store.SetCheckinTime(body.CheckinTime); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		if wantsCORS {
+			if err := a.store.SetCORS(corsEnabled, corsOrigins); err != nil {
+				writeJSONError(w, 500, err.Error())
+				return
+			}
+		}
+		// Hot-apply the log limits so a lowered cap prunes the live recorder at
+		// once, not at the next request or flush.
+		if wantsLogLimits && a.logRec != nil {
+			a.logRec.SetLimits(a.store.GetLogRetentionDays(), a.store.GetLogMaxEntries())
+		}
+		// Hot-apply only when the request actually carried timeout fields:
+		// re-applying store values unconditionally would clobber env-pinned
+		// timeouts on a legacy host/port-only save.
+		if wantsTimeouts {
+			auth.SetStreamTimeouts(
+				time.Duration(a.store.GetChatTimeoutSeconds())*time.Second,
+				time.Duration(a.store.GetIdleTimeoutSeconds())*time.Second,
+			)
+		}
+		timeouts := auth.CurrentStreamTimeouts()
+		retentionDays, maxEntries := a.store.GetLogRetentionDays(), a.store.GetLogMaxEntries()
+		if a.logRec != nil {
+			retentionDays, maxEntries = a.logRec.Limits()
+		}
+		effectiveCORSEnabled, effectiveCORSOrigins, corsEnvManaged := a.corsSettings()
+		writeJSON(w, 200, map[string]interface{}{
+			"host":                 body.Host,
+			"port":                 body.Port,
+			"chat_timeout_seconds": int(timeouts.Header.Seconds()),
+			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
+			"log_retention_days":   retentionDays,
+			"log_max_entries":      maxEntries,
+			"checkin_time":         a.store.GetCheckinTime(),
+			"cors_enabled":         effectiveCORSEnabled,
+			"cors_origins":         effectiveCORSOrigins,
+			"cors_env_managed":     corsEnvManaged,
+			"restart":              "修改主机或端口后需要重启服务才能生效（超时、日志与跨域配置已即时生效）",
+		})
+	default:
+		writeJSONError(w, 405, "方法不允许")
+	}
+}
+
+// --- PAT endpoint ---
+
+func (a *Admin) handlePAT(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// Only the masked form is exposed; the plaintext PAT never leaves
+		// the server. The UI edits it as a whole new value, never in place.
+		masked := maskPAT(a.store.GetPAT())
+		writeJSON(w, 200, map[string]string{"pat_masked": masked})
+	case http.MethodPost:
+		var body struct {
+			PAT string `json:"pat"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		// Store first, then align the account pool with whatever the admin PAT
+		// form submitted (the mirror write stays low-level): a PAT already in
+		// the pool is activated, a new one is added+activated, and clearing the
+		// PAT always deactivates (an empty mirror must not coexist with an
+		// active pool entry — re-activation is one click on the account page).
+		oldPAT := a.store.GetPAT()
+		if err := a.store.SetPAT(body.PAT); err != nil {
+			writeJSONError(w, 500, err.Error())
+			return
+		}
+		switch {
+		case body.PAT == "":
+			if a.store.GetActiveAccountID() != "" {
+				a.store.ClearActiveAccount()
+			}
+		case body.PAT != oldPAT:
+			a.ensureAccount(body.PAT)
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	default:
+		writeJSONError(w, 405, "方法不允许")
+	}
+}
+
+// --- Account endpoints ---
+
+// accountView is the JSON shape of one pool entry. The plaintext PAT never
+// leaves the server: the response carries the same masked form as the legacy
+// PAT endpoint plus the id used by switch/delete.
+type accountView struct {
+	ID        string                 `json:"id"`
+	PATMasked string                 `json:"pat_masked"`
+	Note      string                 `json:"note"`
+	Region    string                 `json:"region"`
+	Weight    int                    `json:"weight"`
+	CreatedAt int64                  `json:"created_at"`
+	Active    bool                   `json:"active"`
+	InFlight  int                    `json:"in_flight"`
+	Capacity  int                    `json:"capacity"`
+	Requests  int64                  `json:"requests"`
+	Snapshot  *store.AccountSnapshot `json:"snapshot,omitempty"`
+	// Daily check-in state.
+	AutoCheckin       bool   `json:"auto_checkin"`
+	CheckinTime       string `json:"checkin_time"`
+	LastCheckinAt     int64  `json:"last_checkin_at"`
+	LastCheckinStatus string `json:"last_checkin_status"`
+	LastCheckinMsg    string `json:"last_checkin_msg"`
+	// CheckinSupported is always true today: both CN and global support daily
+	// check-in. Kept as an explicit field rather than dropped from the wire
+	// format.
+	CheckinSupported bool `json:"checkin_supported"`
+}
+
+// accountViews maps the pool to its wire form, marking the active entry.
+func accountViews(accounts []store.Account, activeID string, runtime AccountRuntime) []accountView {
+	out := make([]accountView, 0, len(accounts))
+	for i := range accounts {
+		acc := accounts[i]
+		region := acc.Region
+		if region == "" {
+			region = "cn"
+		}
+		inflight, capacity, requests := 0, 0, int64(0)
+		if runtime != nil {
+			inflight, capacity, requests = runtime(acc.ID)
+		}
+		out = append(out, accountView{
+			ID:                acc.ID,
+			PATMasked:         maskPAT(acc.PAT),
+			Note:              acc.Note,
+			Region:            region,
+			Weight:            store.AccountWeight(acc),
+			CreatedAt:         acc.CreatedAt,
+			Active:            acc.ID == activeID,
+			InFlight:          inflight,
+			Capacity:          capacity,
+			Requests:          requests,
+			Snapshot:          acc.Snapshot,
+			AutoCheckin:       acc.AutoCheckin,
+			CheckinTime:       acc.CheckinTime,
+			LastCheckinAt:     acc.LastCheckinAt,
+			LastCheckinStatus: acc.LastCheckinStatus,
+			LastCheckinMsg:    acc.LastCheckinMsg,
+			// Both CN and global support daily check-in.
+			CheckinSupported: true,
+		})
+	}
+	return out
+}
+
+// handleAccounts serves GET/POST/DELETE /admin/api/accounts: the multi-account
+// pool CRUD. POST is idempotent on PAT — re-submitting an existing token just
+// activates it, so the old single-PAT panel flow keeps working against this
+// endpoint too.
+func (a *Admin) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, 200, map[string]interface{}{"accounts": accountViews(a.store.ListAccounts(), a.store.GetActiveAccountID(), a.accountRuntime)})
+	case http.MethodPost:
+		var body struct {
+			PAT    string `json:"pat"`
+			Note   string `json:"note"`
+			Region string `json:"region"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		if a.activateExisting(body.PAT) {
+			writeJSON(w, 200, map[string]string{"status": "switched"})
+			return
+		}
+		entry, err := a.store.AddAccountWithRegion(body.PAT, body.Note, body.Region)
+		if err != nil {
+			writeJSONError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, 201, entry)
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeJSONError(w, 400, "缺少 id 参数")
+			return
+		}
+		if err := a.store.DeleteAccount(id); err != nil {
+			writeJSONError(w, 404, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "deleted"})
+	default:
+		writeJSONError(w, 405, "方法不允许")
+	}
+}
+
+// activateExisting switches the active account to an already-pooled PAT.
+// Returns false when pat is not in the pool (caller then adds it).
+func (a *Admin) activateExisting(pat string) bool {
+	if pat == "" {
+		return false
+	}
+	for _, acc := range a.store.ListAccounts() {
+		if acc.PAT == pat {
+			_ = a.store.ActivateAccount(acc.ID)
+			return true
+		}
+	}
+	return false
+}
+
+// ensureAccount aligns the pool after a legacy PAT write: an already-pooled
+// PAT becomes active, a new one is added and activated. Used by the legacy
+// /admin/api/pat endpoint so the pool can never silently diverge from the
+// mirrored PAT field.
+func (a *Admin) ensureAccount(pat string) {
+	if a.activateExisting(pat) {
+		return
+	}
+	_, _ = a.store.AddAccount(pat, "")
+}
+
+// handleAccountSwitch serves POST /admin/api/accounts/switch {id}: explicit
+// account switch from the panel.
+func (a *Admin) handleAccountSwitch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if err := a.store.ActivateAccount(body.ID); err != nil {
+		writeJSONError(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAccountNote serves POST /admin/api/accounts/note {id, note}: renames
+// an account's note (separate endpoint so the account CRUD bodies stay small).
+func (a *Admin) handleAccountNote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID   string `json:"id"`
+		Note string `json:"note"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if err := a.store.UpdateAccountNote(body.ID, body.Note); err != nil {
+		writeJSONError(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAccountWeight serves POST /admin/api/accounts/weight {id, weight}: sets
+// one account's routing weight (1..100). Equal weights mean even distribution.
+func (a *Admin) handleAccountWeight(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID     string `json:"id"`
+		Weight int    `json:"weight"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if err := a.store.SetAccountWeight(body.ID, body.Weight); err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAccountCheck serves POST /admin/api/accounts/check {id?}: probes one
+// account (default: the active one) through a throwaway bridge and stores the
+// returned quota snapshot. This is the only account-side upstream call —
+// deliberately on-demand, since every check costs a full session bootstrap.
+func (a *Admin) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	_ = readJSON(w, r, &body) // body optional: default to the active account
+	id := body.ID
+	if id == "" {
+		id = a.store.GetActiveAccountID()
+	}
+	var target *store.Account
+	for _, acc := range a.store.ListAccounts() {
+		if acc.ID == id {
+			target = &acc
+			break
+		}
+	}
+	if target == nil {
+		writeJSONError(w, 404, "账号不存在")
+		return
+	}
+	if a.accountChecker == nil {
+		writeJSONError(w, 503, "检测功能不可用")
+		return
+	}
+	snap, err := a.accountChecker(r.Context(), target.PAT, target.Region)
+	if err != nil {
+		_ = a.store.SetAccountSnapshot(target.ID, &store.AccountSnapshot{CheckedAt: time.Now().Unix(), LastError: err.Error()})
+		writeJSONError(w, 502, "检测失败: "+err.Error())
+		return
+	}
+	if err := a.store.SetAccountSnapshot(target.ID, snap); err != nil {
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"snapshot": snap})
+}
+
+// handleAccountCheckin serves POST /admin/api/accounts/checkin {id}: runs one
+// daily check-in for the account and returns its result.
+func (a *Admin) handleAccountCheckin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	if body.ID == "" {
+		writeJSONError(w, 400, "缺少 id 参数")
+		return
+	}
+	if _, ok := a.store.GetAccount(body.ID); !ok {
+		writeJSONError(w, 404, "账号不存在")
+		return
+	}
+	if a.accountCheckiner == nil {
+		writeJSONError(w, 503, "签到功能不可用")
+		return
+	}
+	res, err := a.accountCheckiner(r.Context(), body.ID)
+	if err != nil {
+		writeJSONError(w, 502, "签到失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"status":         res.Status,
+		"message":        res.Message,
+		"reward_credits": res.RewardCredits,
+	})
+}
+
+// handleAccountCheckinSetting serves POST /admin/api/accounts/checkin-setting
+// {id, auto_checkin, checkin_time}: the per-account automatic check-in switch
+// and optional time override.
+func (a *Admin) handleAccountCheckinSetting(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var body struct {
+		ID          string `json:"id"`
+		AutoCheckin bool   `json:"auto_checkin"`
+		CheckinTime string `json:"checkin_time"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	acc, ok := a.store.GetAccount(body.ID)
+	if !ok {
+		writeJSONError(w, 404, "账号不存在")
+		return
+	}
+	if err := a.store.UpdateAccountCheckin(acc.ID, body.AutoCheckin, body.CheckinTime); err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// handleAutoSwitch serves GET/POST /admin/api/accounts/auto: the automatic
+// switching switch plus its absolute remaining-credits threshold.
+func (a *Admin) handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		as := a.store.GetAutoSwitch()
+		writeJSON(w, 200, map[string]interface{}{
+			"enabled":            as.Enabled,
+			"threshold":          as.Threshold,
+			"strategy":           as.Strategy,
+			"sticky_limit":       as.StickyLimit,
+			"max_retry_accounts": as.MaxRetryAccounts,
+		})
+	case http.MethodPost:
+		var body struct {
+			Enabled          bool    `json:"enabled"`
+			Threshold        float64 `json:"threshold"`
+			Strategy         string  `json:"strategy"`
+			StickyLimit      int     `json:"sticky_limit"`
+			MaxRetryAccounts int     `json:"max_retry_accounts"`
+		}
+		if err := readJSON(w, r, &body); err != nil {
+			writeJSONError(w, 400, "请求格式错误")
+			return
+		}
+		cfg := a.store.GetAutoSwitch()
+		cfg.Enabled = body.Enabled
+		cfg.Threshold = body.Threshold
+		if body.Strategy != "" {
+			cfg.Strategy = body.Strategy
+		}
+		if body.StickyLimit > 0 {
+			cfg.StickyLimit = body.StickyLimit
+		}
+		if body.MaxRetryAccounts > 0 {
+			cfg.MaxRetryAccounts = body.MaxRetryAccounts
+		}
+		if err := a.store.SetAutoSwitchConfig(cfg); err != nil {
+			writeJSONError(w, 400, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	default:
+		writeJSONError(w, 405, "方法不允许")
+	}
+}
+
+// --- Models endpoint ---
+
+func (a *Admin) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	var modelList []string
+	if a.modelFetcher != nil {
+		modelList = a.modelFetcher(r.Context())
+	}
+	if modelList == nil {
+		catalog := models.DefaultCatalog()
+		modelList = catalog.Keys()
+	}
+	writeJSON(w, 200, map[string]interface{}{"models": modelList})
+}
+
+// --- Stats endpoint ---
+
+func (a *Admin) handleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	if a.stats == nil {
+		writeJSON(w, 200, stats.Report{})
+		return
+	}
+	writeJSON(w, 200, a.stats.Report())
+}
+
+// --- Logs endpoint ---
+
+// handleLogs serves GET /admin/api/logs: a paginated, filterable request log.
+// Query params: model (substring), key_id (exact), status ("error" or a code),
+// page, page_size.
+func (a *Admin) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	if a.logRec == nil {
+		writeJSON(w, 200, logs.Result{Logs: []logs.LogEntry{}})
+		return
+	}
+	q := r.URL.Query()
+	f := logs.Filter{
+		Model:    strings.TrimSpace(q.Get("model")),
+		KeyID:    strings.TrimSpace(q.Get("key_id")),
+		Page:     atoiDefault(q.Get("page"), 1),
+		PageSize: atoiDefault(q.Get("page_size"), 20),
+	}
+	switch v := q.Get("status"); v {
+	case "error":
+		f.Status = -1
+	case "":
+		// no status filter
+	default:
+		if n, err := strconv.Atoi(v); err == nil {
+			f.Status = n
+		}
+	}
+	writeJSON(w, 200, a.logRec.Query(f))
+}
+
+// atoiDefault parses s as an int, falling back to def when empty or invalid.
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// maskPAT returns a masked version of the PAT for display.
+func maskPAT(pat string) string {
+	if len(pat) <= 8 {
+		if pat == "" {
+			return ""
+		}
+		return "****"
+	}
+	return pat[:4] + "****" + pat[len(pat)-4:]
+}

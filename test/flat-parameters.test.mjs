@@ -7,13 +7,12 @@
  * 修复 = 补 `{ type: 'object', properties: { ... } }` 外壳，参数一个不少、名字一个不改。
  *
  * 覆盖：A. 单函数单元；B. 决定性消融；C. 负向对照（type=string/object/number/array）；
- * D. 不变量（合规外壳逐字节不动、幂等、异常形状不崩）；E. 六个 provider 都接同一份 wrap。
+ * D. 不变量（合规外壳逐字节不动、幂等、异常形状不崩）；E. 五个 provider 都接同一份 wrap。
  *
  * 运行：node test/flat-parameters.test.mjs
  */
 
 import { hasObjectShell, wrapFlatParameters, normalizeToolParameters } from '../lib/rules/flat-parameters.mjs'
-import { loomyRules } from '../lib/rules/loomy.mjs'
 import { officeaceRules } from '../lib/rules/officeace.mjs'
 import { genericRules } from '../lib/rules/generic.mjs'
 import { clineRules } from '../lib/rules/cline.mjs'
@@ -99,7 +98,7 @@ function cleanTool(name) {
 }
 {
   const body = { model: 'spark-x2.6', messages: [{ role: 'user', content: 'hi' }], tools: [flatTool('cnki_search')] }
-  const { notes } = loomyRules.normalizeRequest({ body })
+  const { notes } = genericRules.normalizeRequest({ body })
   const p = body.tools[0].function.parameters
   check('消融 裸根补壳 -> 合规外壳', isShell(p))
   check('消融 根级 type 降为 properties 普通参数', p.properties.type && p.properties.type.type === 'string' && Array.isArray(p.properties.type.enum))
@@ -107,7 +106,7 @@ function cleanTool(name) {
 }
 {
   const body = { model: 'x', messages: [], tools: [flatTool('cnki_search', false)] }
-  const { notes } = loomyRules.normalizeRequest({ body })
+  const { notes } = genericRules.normalizeRequest({ body })
   const p = body.tools[0].function.parameters
   check('负向-改名 仍补成外壳', isShell(p))
   check('负向-改名 原 kind 参数原样落在 properties 里', 'kind' in p.properties && p.properties.kind && p.properties.kind.type === 'string')
@@ -119,12 +118,12 @@ function cleanTool(name) {
   for (let i = 0; i < 93; i++) tools.push(cleanTool('tool_' + i))
   for (const n of ['cnki_search', 'cnki_download', 'cnki_batch', 'cnki_verify', 'cnki_task_status', 'cnki_doctor']) tools.push(flatTool(n))
   const body = { model: 'spark-x2.6', messages: [], tools }
-  const { notes } = loomyRules.normalizeRequest({ body })
+  const { notes } = genericRules.normalizeRequest({ body })
   const wrapped = body.tools.filter((t) => { const fn = t.function || t; return fn.parameters && fn.parameters.type === 'object' }).length
   equal('混合 全部补成合规外壳', wrapped, 99)
   check('混合 notes 报 6 个补壳', notes.some((n) => n.includes('wrapped 6 flat tool parameter')))
   const snap = JSON.stringify(body)
-  const { notes: notes2 } = loomyRules.normalizeRequest({ body: JSON.parse(snap) })
+  const { notes: notes2 } = genericRules.normalizeRequest({ body: JSON.parse(snap) })
   check('混合 二次净化不再补壳', !notes2.some((n) => n.includes('flat tool parameter')))
 }
 
@@ -135,7 +134,7 @@ function wrapVia(rules, params) {
   return body.tools[0].function.parameters
 }
 {
-  const p = wrapVia(loomyRules, { type: 'string', q: { type: 'string' } })
+  const p = wrapVia(genericRules, { type: 'string', q: { type: 'string' } })
   check('负向 type=string：补壳后根 type 变 object（不再是裸 string）', p.type === 'object')
   check('负向 type=string：根级 type 值沦为 properties 里的普通参数（值仍是 string）', p.properties.type === 'string')
   check('负向 type=string：根级 type 没有被当成 schema 关键字吞掉', !('type' in p) || p.type === 'object')
@@ -164,7 +163,7 @@ function wrapVia(rules, params) {
 // E. ---------------------------------------------------------------- 所有 provider 都接了同一份 wrap
 {
   const providers = [
-    ['loomy', loomyRules], ['officeace', officeaceRules], ['generic', genericRules],
+    ['officeace', officeaceRules], ['generic', genericRules],
     ['cline', clineRules], ['raccoon', raccoonRules], ['codearts', codeartsRules],
   ]
   for (const [name, rules] of providers) {

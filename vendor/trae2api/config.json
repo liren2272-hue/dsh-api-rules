@@ -1,0 +1,80 @@
+{
+  "listen": "127.0.0.1:7870",
+  "api_key": "",
+  "web_password": "",
+  "trust_proxy_headers": false,
+  "data_dir": "./data",
+  "pool": {
+    "max_in_flight": 8,
+    "breaker_threshold": 3,
+    "breaker_cooldown": "30m",
+    "idle_weight_per_hour": 0.5,
+    "idle_weight_max": 5,
+    "pick_gap": "0s"
+  },
+  "cooldown": {
+    "soft_rate": "600s",
+    "soft_rate_max": "2h",
+    "model_cooldown": "600s"
+  },
+  "trae": {
+    "accounts": null,
+    "chat_base": "",
+    "user_agent": "",
+    "ide_version": "",
+    "ide_version_code": "",
+    "idle_timeout_seconds": 120,
+    "strict_models": true,
+    "vision_enabled": false,
+    "cross_realm_failover": null,
+    "proxy": ""
+  },
+  "schedule": {
+    "checkin_enabled": true,
+    "checkin_hours": [
+      9,
+      21
+    ]
+  },
+  "session_sticky": {
+    "enabled": true,
+    "ttl": "30m"
+  },
+  "metrics": {
+    "retain_days": 14,
+    "enabled": true
+  },
+  "prompt": {
+    "mode": "passthrough",
+    "text": ""
+  },
+  "login": {
+    "login_host": "https://www.trae.cn",
+    "api_host": "https://api.trae.cn"
+  },
+  "intl": {
+    "enabled": true,
+    "ug_host": "https://ug-normal.trae.ai",
+    "login_host": "https://www.trae.ai",
+    "chat_host": "https://core-normal.trae.ai",
+    "trae_client_id": "ono9krqynydwx5",
+    "solo_client_id": "en1oxy7wnw8j9n"
+  },
+  "files": {
+    "enabled": false,
+    "allowed_roots": null,
+    "max_file_bytes": 0,
+    "max_total_bytes": 0,
+    "max_files": 0
+  },
+  "model_aliases": null,
+  "webhook": {
+    "enabled": false,
+    "url": "",
+    "secret": ""
+  },
+  "update": {
+    "enabled": true,
+    "repo": "XCool-603/trae2api"
+  }
+}

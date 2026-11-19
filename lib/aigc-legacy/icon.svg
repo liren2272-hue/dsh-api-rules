@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" role="img" aria-label="Tongji AIGC">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1f6feb"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="30" height="30" rx="8" fill="url(#g)"/>
+  <path d="M11 24V12h3.2l5.8 8.2V12H22v12h-3.2l-5.8-8.2V24H11z" fill="#ffffff"/>
+  <circle cx="26" cy="11" r="2.4" fill="#ffffff"/>
+</svg>

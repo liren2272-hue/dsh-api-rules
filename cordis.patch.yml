@@ -37,8 +37,22 @@
                 maxTokens: 65536
               - id: deepseek-v4.1-flash
                 maxTokens: 65536
+                supportsImages: true
               - id: kimi-k3
                 maxTokens: 65536
+                supportsImages: true
+              - id: glm-5.3-flash
+                maxTokens: 65536
+                # 上游 /v1/models 声明 image，且已用 nonce 图实测通过。
+                supportsImages: true
+              - id: kimi-k3.1-pro
+                maxTokens: 65536
+                # 上游 /v1/models 声明 image，且已用 nonce 图实测通过。
+                supportsImages: true
+              - id: deepseek-v4.1-flash-1017
+                maxTokens: 65536
+                # 上游 /v1/models 声明 image，且已用 nonce 图实测通过。
+                supportsImages: true
           # 果办 (OfficeAce)：DSH -> 8788（本插件，回环转发 + 参数规则）-> 本插件自带的
           # officeace2api :7864（源码内嵌在 vendor/officeace2api/）。
           #
@@ -62,11 +76,13 @@
             # 已经跑着的实例绝不重复拉起；只在没人监听 7864 时才用内嵌副本起一个。
             # 健康端点在站点根（/healthz），不在 upstream 之后，所以用 readyUrl。
             launch:
-              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
+              # ⚠ 按本机实际路径填写：node.exe 用你 DSH runtime 里的绝对路径，
+              # cwd 用本插件 vendor/officeace2api 的绝对路径。
+              command: "node.exe"
               args:
                 - "src/index.mjs"
               # config.json 按 process.cwd() 解析，必须把 cwd 指到内嵌副本根目录。
-              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\officeace2api"
+              cwd: "vendor/officeace2api"
               readyUrl: "http://127.0.0.1:7864/healthz"
               readyTimeoutMs: 30000
               readyPollMs: 500
@@ -140,7 +156,8 @@
             # 退避负责；流已开（pipeStream 读响应体）阶段的掐断本就不可重试，放大预算即可。
             timeoutMs: 600000
             launch:
-              command: "C:\\Users\\15940\\.dsh\\cline2api\\cline-proxy.exe"
+              # ⚠ 填你本机 cline2api 的 cline-proxy.exe 绝对路径。
+              command: "cline-proxy.exe"
               args:
                 - "-port"
                 - "3457"
@@ -206,11 +223,12 @@
             concurrency: 4
             sessionHoldMs: 60000
             launch:
-              command: "C:\\Users\\15940\\.dsh\\cpa\\cli-proxy-api.exe"
+              # ⚠ 填你本机 CLIProxyAPI 的 cli-proxy-api.exe 与 config.yaml 绝对路径。
+              command: "cli-proxy-api.exe"
               args:
                 - "-config"
-                - "C:\\Users\\15940\\.dsh\\cpa\\config.yaml"
-              cwd: "C:\\Users\\15940\\.dsh\\cpa"
+                - "config.yaml"
+              cwd: "."
               # CPA 没有 /health 路由（实测 404）；/v1/models 无鉴权头时回 401，
               # 但启动探活只要求「收到 HTTP 响应」，401 同样证明进程已在监听。
               readyPath: "/v1/models"
@@ -260,115 +278,6 @@
                 contextWindow: 256000
                 maxTokens: 63999
 
-          # Loomy（loomy2api）：DSH -> 8788（本插件，回环转发 + 参数规则）-> loomy2api :17890。
-          #
-          # loomy2api 是讯飞星火 Loomy 平台的 OpenAI/Anthropic 兼容网关（多账号池 + Web 面板），
-          # 源码内嵌在本插件的 vendor/loomy2api/（纯标准库 Python），由本路由的 launch 在插件
-          # 启动时自动拉起（已运行时绝不重复拉起）。它自己负责换号 / 账号冷却 / 上游 429、401、
-          # 402、403、5xx 的重试，本层（rules: [loomy]）只做参数整形，不叠第二层退避。
-          #
-          # 账号来源：loomy2api 默认 sessions_from_client=True，会自动复用本机 Loomy 桌面客户端
-          # 的登录态；也可以到面板 http://127.0.0.1:17890/panel 手动加账号（看积分/用量/日志）。
-          #
-          # launch.env 里用 LOOMY_API_KEYS 钉一个**已知**网关 key（环境变量优先于 config.json），
-          # 绕开 loomy2api「首启随机 key 只打印一次」的取值难题；route.apiKey 用同一个值对齐。
-          #
-          # 与 officeace 同理：拉起的是**本插件目录里的源码副本**（.venv + vendor/loomy2api），
-          # 插件之外没有任何需要保留的文件夹，误删外部目录也不会让 Loomy 失联。
-          - id: loomy2api
-            upstream: "http://127.0.0.1:17890/v1"
-            apiKey: "sk-loomy-local"
-            # 面板本身免鉴权，这是「打开管理面板」的跳转入口，不是登录凭证。
-            adminUrl: "http://127.0.0.1:17890/panel"
-            rules:
-              - loomy2api
-            concurrency: 4
-            sessionHoldMs: 60000
-            # spark-x2.6 长思考流（10万+ token 上下文）常超规则层默认 120s 的
-            # AbortSignal.timeout，把响应体掐断 → 网关 10053 → 只剩思考的截断流被补成
-            # finish_reason:'stop'（用户看到「把思考当结果输出」）。
-            # 对齐内嵌网关自己的兜底：vendor config.py 的 "timeout": 3600 注释写明
-            # 「1200s 只够 ~36K token@30tok/s — 提到 3600s 一小时兜底」。600s 比之
-            # 更短，仍会截掉长任务；这里抬到 1 小时。真正的「卡死」保护由网关的
-            # stream_idle_timeout（单次 read 无数据 120s 判死）+ 客户端断开信号承担，
-            # 总时长上限只需宽松到不误杀合法长流即可。
-            timeoutMs: 3600000
-            # 生图/生视频通道声明（goal-58ba6a2c）。这些 media 模型只认
-            # /v1/images|videos/generations，不进上面的 chat models 清单（打 chat 会 400）；
-            # 设置卡片的「生图 / 生视频」面板读这段决定展示哪个表单与模型下拉。
-            # loomy2api 实测只支持生图（/v1/videos/generations 返回「未知路径」）。
-            media:
-              images:
-                - Hy-Image-3.5-preview
-                - doubao-seedream-5-lite
-                - qwen-image-3.0-pro
-            launch:
-              # 用内嵌 .venv 的 python，不依赖用户全局 python 的版本/位置。
-              command: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\loomy2api\\.venv\\Scripts\\python.exe"
-              args:
-                - "-m"
-                - "loomy2api"
-                - "serve"
-              # config.json / accounts.json / logs 按 process.cwd()（=PROJECT_ROOT）解析，必须指到内嵌副本根。
-              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\loomy2api"
-              env:
-                LOOMY_PORT: "17890"
-                LOOMY_API_KEYS: "sk-loomy-local"
-                LOOMY_PANEL_PASSWORD: "sk-loomy-local"
-                LOOMY_LOG_DIR: "logs"
-              # /health 在站点根，不在 upstream 之后，所以用 readyUrl。
-              readyUrl: "http://127.0.0.1:17890/health"
-              readyTimeoutMs: 60000
-              readyPollMs: 1000
-              killOnStop: true
-            # 模型清单（实测自本机 loomy2api /v1/models 的 live catalogue：maxTokens=上游
-            # max_output_tokens、contextWindow=上游 context_length；vision=T 才标 input:[text,image]）。
-            # 上游那 3 个 type=image 的生图模型（Hy-Image-3.5-preview / doubao-seedream-5-lite /
-            # qwen-image-3.0-pro）**不进本清单**：它们只认 /v1/images/generations，打 chat 端点会 400/404。
-            # 模型选择器里显示哪些由下面 llm-pi-ai 那段决定，增删模型时两处必须一起改。
-            # 注意：上游 capabilities.vision 会骗人。deepseek-v4-flash-0731 上游标 vision=false，
-            # 但实测直发图片能准确读出图内文字（2026-11-06 用测试图验证两次），故按视觉模型声明。
-            # 反向已验证确无视觉：spark-x2.6（回"无法查看图片"）、qwen-3.8-max（上游 400）。
-            models:
-              - id: spark-x2.6
-                contextWindow: 1048576
-                maxTokens: 131072
-              - id: DeepSeek-V4.1-Flash
-                contextWindow: 1048576
-                maxTokens: 384000
-                input:
-                  - text
-                  - image
-              - id: deepseek-v4-flash-0731
-                contextWindow: 1048576
-                maxTokens: 384000
-                input:
-                  - text
-                  - image
-              - id: qwen-3.8-max
-                contextWindow: 1000000
-                maxTokens: 65536
-              - id: GLM-5.3-Flash
-                contextWindow: 1048576
-                maxTokens: 131072
-                input:
-                  - text
-                  - image
-              - id: qwen3.8-flash
-                contextWindow: 1000000
-                maxTokens: 131072
-                input:
-                  - text
-                  - image
-              - id: mimo-v2.5
-                contextWindow: 1048576
-                maxTokens: 131072
-                input:
-                  - text
-                  - image
-              - id: auto
-                maxTokens: 65536
-
           # MiniMax（minimax2api）：DSH -> 8788（本插件，回环转发 + 参数规则）-> minimax2api :8080。
           #
           # minimax2api 是 MiniMax Agent 官方客户端的 OpenAI/Anthropic 兼容网关
@@ -411,13 +320,14 @@
             launch:
               # 经 node 启动器同时拉起「网关 + 浏览器登录 CDP bridge(:8766)」，
               # 使浏览器加账号随路由自启自停（此前只起 exe，bridge 丢失导致浏览器登录失效）。
-              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
+              # ⚠ 按本机实际路径填写：node.exe 与 launch-minimax2api.mjs / cwd 都改成绝对路径。
+              command: "node.exe"
               args:
-                - "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\minimax2api\\launch-minimax2api.mjs"
+                - "vendor/minimax2api/launch-minimax2api.mjs"
                 - "-addr"
                 - "127.0.0.1:8080"
               # app.json / generated/ 按 process.cwd() 解析，必须指到内嵌副本根。
-              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\minimax2api"
+              cwd: "vendor/minimax2api"
               env:
                 MINIMAX2API_DATA: "data"
                 MINIMAX2API_ADMIN_PASSWORD: "sk-mm-local"
@@ -467,12 +377,13 @@
             adminUrl: http://127.0.0.1:7870/
             label: Trae
             launch:
-              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
+              # ⚠ 按本机实际路径填写：node.exe 与 launch.mjs / cwd 都改成绝对路径。
+              command: "node.exe"
               args:
-                - "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\trae2api\\launch.mjs"
+                - "vendor/trae2api/launch.mjs"
                 - "-listen"
                 - "127.0.0.1:7870"
-              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\trae2api"
+              cwd: "vendor/trae2api"
               env:
                 HTTPS_PROXY: "http://127.0.0.1:10808"
                 HTTP_PROXY: "http://127.0.0.1:10808"
@@ -960,114 +871,6 @@
               low: low
               medium: medium
               high: high
-      # loomy（loomy2api）：baseURL 指向本插件 8788 上的 /loomy/v1 路由，
-      # 该路由在插件启动时自动拉起内嵌的 vendor/loomy2api（默认 :17890）。
-      #
-      # 这里是**模型选择器显示哪些模型**的唯一来源：llm-pi-ai 不会向上游查询清单，
-      # 只展示这段里声明过的条目。与上面 loomy 路由的 models 保持一致（增删两处一起改）。
-      # input: [text, image] 标记视觉模型，DSH 才会在 UI 上给出「发图」入口并真正送图。
-      loomy2api:
-        # 模型选择器里这个 provider 的**显示名**（llm-pi-ai 的 displayName 字段，selector 取
-        # displayName ?? provider）。不设就回落到 map key「loomy2api」，所以这里显式写成 Loomy。
-        # map key 本身是功能路由键，不能改。
-        displayName: Loomy
-        apiKeyEnv: API_RULES_BEARER
-        api: openai-completions
-        baseURL: http://127.0.0.1:8788/loomy2api/v1
-        models:
-          # 实测自本机 loomy2api /v1/models 的 live catalogue。maxTokens=上游 max_output_tokens，
-          # contextWindow=上游 context_length；vision=T 才标 input:[text,image]。3 个生图模型不进本清单。
-          # 强度档位取自上游逐模型暴露的 reasoning_efforts：[low, medium, high, xhigh]（none 走 off 档，未声明）；
-          # qwen-3.8-max 上游未给该字段，auto 是动态路由，两者都不声明。
-          - id: spark-x2.6
-            name: Spark-X2.6
-            contextWindow: 1048576
-            maxTokens: 131072
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-          - id: DeepSeek-V4.1-Flash
-            name: DeepSeek-V4.1-Flash
-            contextWindow: 1048576
-            maxTokens: 384000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-          - id: deepseek-v4-flash-0731
-            name: DeepSeek-V4-Flash-0731
-            contextWindow: 1048576
-            maxTokens: 384000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-          - id: qwen-3.8-max
-            name: Qwen-3.8-Max
-            contextWindow: 1000000
-            maxTokens: 65536
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: GLM-5.3-Flash
-            name: GLM-5.3-Flash
-            contextWindow: 1048576
-            maxTokens: 131072
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-          - id: qwen3.8-flash
-            name: Qwen3.8-Flash
-            contextWindow: 1000000
-            maxTokens: 131072
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-          - id: mimo-v2.5
-            name: MiMo-V2.5
-            contextWindow: 1048576
-            maxTokens: 131072
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-          - id: auto
-            name: Auto（上游自动选模型）
-            maxTokens: 65536
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-
       # MiniMax（minimax2api）：与上面 minimax2api 路由一一对应。
       # 网关把 thinking 当布尔开关，规则层（minimax2api.mjs）把 DSH 的 reasoning_effort
       # 档位翻译成 thinking true/false；m3.1-flash 思考强制开、m3 可开关。

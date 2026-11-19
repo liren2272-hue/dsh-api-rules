@@ -4,16 +4,6 @@ node_modules/
 Thumbs.db
 *.swp
 *.bak
-# 内嵌 loomy2api：按 officeace2api 的先例平铺纳入版本库（源码随插件分发，
-# 拉起用的 .venv/ 源码副本才不会在全新 clone 后失联）。其上游 .git 已移出，
-# 运行时产物（虚拟环境 / 日志 / 生成的 config 与账号）一律忽略。
-vendor/loomy2api/.venv/
-vendor/loomy2api/logs/
-vendor/loomy2api/logs-smoke/
-vendor/loomy2api/logs-test/
-vendor/loomy2api/config.json
-vendor/loomy2api/accounts.json
-vendor/loomy2api/accounts-test.json
 # 内嵌 qoder2api-hub：同 loomy2api，源码平铺纳入版本库（未纳入其上游 .git）。
 # 运行时产物（字节码缓存 / 账号 / 用量 / 日志）一律忽略；仅保留 accounts/README.txt 占位目录。
 vendor/qoder2api-hub/__pycache__/
@@ -22,3 +12,47 @@ vendor/qoder2api-hub/accounts/*
 vendor/qoder2api-hub/usage/
 vendor/qoder2api-hub/logs/
 vendor/qoder2api-hub/qoder-proxy.log
+
+# 同济 VPN 自动拨号凭据（含明文统一身份认证密码，绝不入库）。
+# 保留 .example 模板供克隆后照着填。
+tongji-vpn.env
+!tongji-vpn.env.example
+
+# 运行时数据 / 本机账号 / 本机路径 / 二进制产物，绝不入库。
+vendor/minimax2api/data/
+vendor/minimax2api/minimax2api.exe
+vendor/officeace2api/data/
+vendor/officeace2api.bak-*/
+vendor/officeace2api.corrupt-data-*/
+
+# 本地编辑备份 / 归档 / 调试探针，不入库。
+*.bak-*
+*.bak
+.loomy-removal-backup-*/
+tmp-*.json
+tmp-*/
+.whisper-*
+*.wav
+*.wav.json
+tmp/
+scripts/
+.claude/
+.vscode/
+test/manual_*
+
+# vendor 目录下各内嵌网关的编译产物 / 可执行文件 / 运行时数据，绝不入库。
+vendor/*.exe
+vendor/*/*.exe
+vendor/*/*.exe~
+vendor/*/*-new.exe
+vendor/minimax2api/*.exe
+vendor/minimax2api/*.exe~
+vendor/qoder2api-go/target/
+vendor/qoder2api-go/data/
+vendor/qoder2api-go/logs/
+vendor/qoder2api/data/
+vendor/qoder2api/logs/
+vendor/qoder2api/secrets/
+vendor/trae2api/target/
+vendor/trae2api/data/
+vendor/trae2api/*.exe

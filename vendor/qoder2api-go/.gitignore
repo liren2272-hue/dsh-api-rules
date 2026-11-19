@@ -1,0 +1,10 @@
+# 编译产物（首跑由 launch.mjs 现场编译，不入库）
+qoder2api.exe
+qoder2api-vtest.exe
+qoder2api-test.exe
+
+# 运行数据 / 日志（PAT、API key 等敏感信息，绝不入库）
+/data/
+/logs/
+*.log
+*.pid

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-api-rules",
-  "version": "1.0.33",
+  "version": "1.0.56",
   "icon": "./icon.svg",
   "private": true,
   "type": "module",

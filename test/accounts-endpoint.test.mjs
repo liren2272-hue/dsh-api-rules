@@ -173,3 +173,50 @@ test('credentialed route stores endpoint credential, masks it, and keeps it on p
   assert.equal((await call(listHandler, get('/api/api-rules/accounts'))).body.routes.find((r) => r.id === 'officeace').adminUrl,
     'http://127.0.0.1:7864/admin?token=officeace-local-admin')
 })
+
+
+// m03964: a dynamic upstream (from upstreams.json) must expose its REAL upstream URL,
+// credential ref and passthrough flag on the accounts endpoint, so the settings card can
+// show address + key instead of an empty "management panel not configured" note.
+// Static routes stay unmarked. No plaintext key is echoed.
+// 静态接线断言：accounts 端点必须把动态上游的真实地址/凭据名/透传/动态标记注入卡片 payload。
+// 运行态表现由铲子网关的真实 GUI 验证覆盖；这里用源码锚点保证服务端字段注入不会被悄悄删掉，
+// 且对补丁前版本（无 dynamicUpstream 字段注入）会变红。不启动 proxy，无句柄泄漏。
+test('accounts endpoint wires dynamic upstream fields into the card payload', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('../lib/index.mjs', import.meta.url), 'utf8')
+
+  // mergeUpstreamRoutes() 必须给上游派生路由打动态标记
+  assert.match(
+    src,
+    /routeConfigs\.push\(\{ \.\.\.route, packs, dynamicUpstream: true \}\)/,
+    'mergeUpstreamRoutes must mark upstream-derived routes as dynamic',
+  )
+  // accounts 列表必须把四个字段回给设置卡片
+  assert.match(
+    src,
+    /dynamicUpstream: route\.dynamicUpstream === true,/,
+    'accounts must expose the dynamicUpstream flag',
+  )
+  assert.match(
+    src,
+    /upstreamUrl: typeof route\.upstream === 'string' \? route\.upstream : '',/,
+    'accounts must expose the REAL upstream URL (never a 127.0.0.1 proxy mapping)',
+  )
+  assert.match(
+    src,
+    /apiKeyEnv: typeof route\.apiKeyEnv === 'string' && route\.apiKeyEnv !== '' \? route\.apiKeyEnv : '',/,
+    'accounts must expose the credential ref name',
+  )
+  assert.match(
+    src,
+    /passthroughAuth: route\.passthroughAuth === true,/,
+    'accounts must expose the passthrough flag',
+  )
+  // 不能把密钥本身当成地址回显
+  assert.doesNotMatch(
+    src,
+    /upstreamUrl: route\.apiKey/,
+    'must not echo any key material as the address',
+  )
+})

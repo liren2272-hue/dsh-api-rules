@@ -1,0 +1,19 @@
+{
+  "host": "0.0.0.0",
+  "port": 10081,
+  "pat": "",
+  "password": "password",
+  "api_keys": [],
+  "log_retention_days": 90,
+  "log_max_entries": 2000,
+  "chat_timeout_seconds": 120,
+  "idle_timeout_seconds": 300,
+  "auto_switch": {
+    "enabled": false,
+    "threshold": 20,
+    "strategy": "sticky",
+    "sticky_limit": 30,
+    "max_retry_accounts": 3
+  },
+  "checkin_time": "10:15"
+}

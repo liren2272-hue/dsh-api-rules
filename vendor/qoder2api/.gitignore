@@ -1,0 +1,8 @@
+# 只忽略运行时产物，绝不忽略分发物（Go 源码 / launch.mjs / go.mod / webconsole / baseprompt.json
+# 都必须进 git，否则新 clone 缺件）。二进制 qoder2api.exe 由 launch.mjs 首次运行现场编译，不入库。
+qoder2api.exe
+/data/
+/logs/
+*.log
+*.pid
+qoder-proxy.log

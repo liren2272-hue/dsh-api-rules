@@ -20,7 +20,6 @@ import {
 import { raccoonRules } from '../lib/rules/raccoon.mjs'
 import { officeaceRules } from '../lib/rules/officeace.mjs'
 import { codeartsRules } from '../lib/rules/codearts.mjs'
-import { loomyRules } from '../lib/rules/loomy.mjs'
 import { clineRules } from '../lib/rules/cline.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -122,11 +121,6 @@ equal('raccoon 未知值原样', translateEffort('raccoon', 'xhigh', 'raccoon/sn
   const body = { messages: [], reasoning_effort: 'xhigh' }
   const out = codeartsRules.normalizeRequest({ body, model: 'codearts/GLM-5.2' })
   equal('codearts 包保留 reasoning_effort', out.body['reasoning_effort'], 'xhigh')
-}
-{
-  const body = { messages: [], reasoning_effort: 'xhigh' }
-  const out = loomyRules.normalizeRequest({ body, model: 'loomy2api/spark-x2.6' })
-  equal('loomy 包保留 reasoning_effort', out.body['reasoning_effort'], 'xhigh')
 }
 {
   const body = { messages: [], reasoning_effort: 'max' }

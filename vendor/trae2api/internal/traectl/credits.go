@@ -1,0 +1,479 @@
+package traectl
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// 本文件实现「用户成长 / 商业」类接口：签到、额度用量、付费状态。
+//
+// 这些接口与 chat 走**不同的鉴权头**：chat 用 Authorization + X-Cloudide-Token
+// 且带全套指纹头；UG 接口只需 `Authorization: Cloud-IDE-JWT <token>` +
+// `x-device-id: <数字设备ID>`（注意是**数字 ID**，不是 chat 用的 sha256 派生值）。
+// 混用会 401。
+//
+// 全部端点在真实账号上实测可用（见 README「协议要点」）。
+const (
+	// pathCheckinStatus 签到状态查询。
+	pathCheckinStatus = "/trae/api/v2/ug/checkin_credits/status"
+	// pathCheckinClaim 签到领取（固定 100 积分）。
+	pathCheckinClaim = "/trae/api/v2/ug/checkin_credits/claim"
+	// pathEntUsage 额度用量（余额、消耗比例、权益包明细）。
+	pathEntUsage = "/trae/api/v2/pay/ide_user_ent_usage"
+	// pathPayStatus 付费状态与可参与活动（CN 版）。
+	pathPayStatus = "/trae/api/v2/pay/ide_user_pay_status"
+	// pathPayStatusV1 付费状态（国际版，实测可用）。
+	pathPayStatusV1 = "/trae/api/v1/pay/ide_user_pay_status"
+)
+
+// CheckinStatus 是签到状态。
+type CheckinStatus struct {
+	// CheckedIn 今日是否已签到。
+	CheckedIn bool `json:"checked_in"`
+	// DIDCheckedIn 设备维度是否已签到（多设备场景下与 CheckedIn 可能不同）。
+	DIDCheckedIn bool `json:"did_checked_in"`
+	// Enable 签到功能是否对该账号开放。
+	Enable bool `json:"enable"`
+	// Credits 本次签到可得积分。
+	Credits int64 `json:"credits"`
+	// ExtraCredits 额外奖励积分。
+	ExtraCredits int64 `json:"extra_credits"`
+	// Code 业务码，0 = 成功。
+	Code int `json:"code"`
+	// Message 业务消息。
+	Message string `json:"message"`
+}
+
+// UsageSummary 是用量汇总。
+type UsageSummary struct {
+	// ConsumedAmount 已消耗积分。
+	ConsumedAmount float64 `json:"consumed_amount"`
+	// ConsumptionRatio 消耗比例（0~1）。
+	ConsumptionRatio float64 `json:"consumption_ratio"`
+	// TotalAmount 总额度。
+	TotalAmount float64 `json:"total_amount"`
+}
+
+// Remaining 返回剩余积分（负数按 0 处理）。
+func (u UsageSummary) Remaining() float64 {
+	r := u.TotalAmount - u.ConsumedAmount
+	if r < 0 {
+		return 0
+	}
+	return r
+}
+
+// EntitlementPack 是一个权益包。
+type EntitlementPack struct {
+	DisplayDesc string `json:"display_desc"`
+	BaseInfo    struct {
+		EntitlementID string  `json:"entitlement_id"`
+		EndTime       int64   `json:"end_time"`
+		ChargeAmount  float64 `json:"charge_amount"`
+		EntStatus     int     `json:"ent_status"`
+	} `json:"entitlement_base_info"`
+}
+
+// EntUsage 是额度用量响应。
+type EntUsage struct {
+	IsCreditsBilling bool         `json:"is_credits_billing"`
+	IsPayFreshman    bool         `json:"is_pay_freshman"`
+	UsageSummary     UsageSummary `json:"usage_summary"`
+	// Packs 权益包列表（原字段名 user_entitlement_pack_list）。
+	Packs []EntitlementPack `json:"user_entitlement_pack_list"`
+}
+
+// SumExpiringCredits 汇总**即将过期**的额度量（`within` 内到期的权益包金额之和）。
+//
+// 用途：选号时优先消耗快过期的额度，避免白白作废（参考实现的三因子之一）。
+//
+// 实现说明与取舍：
+//   - 上游的权益包里只有 `charge_amount`（该包的**面额**）与 `end_time`，
+//     **没有"该包剩余多少"**。所以这里用的是"面额之和"而不是"剩余之和" ——
+//     它是一个**上界**，用来表达"这个账号有多少额度正面临作废风险"。
+//   - 对选号权重而言，上界已经够用：我们要的是账号之间的**相对**紧迫度，
+//     不是精确的作废金额。
+//   - `end_time` 为 0 或负值表示"无到期时间"（永久有效），不计入。
+func (u *EntUsage) SumExpiringCredits(within time.Duration, now time.Time) int64 {
+	if u == nil || within <= 0 {
+		return 0
+	}
+	deadline := now.Add(within).Unix()
+	var sum int64
+	for _, p := range u.Packs {
+		end := p.BaseInfo.EndTime
+		if end <= 0 {
+			continue // 无到期时间 = 永久，不构成作废风险
+		}
+		if end <= deadline {
+			sum += int64(p.BaseInfo.ChargeAmount)
+		}
+	}
+	return sum
+}
+
+// DefaultExpiringWindow 是"即将过期"的判定窗口（30 天：覆盖月度权益包）。
+//
+// 取 7 天：太短（如 1 天）会让绝大多数账号都算出 0（因子失效）；
+// 太长（如 30 天）会让"快过期"失去区分度（几乎所有账号都命中）。
+const DefaultExpiringWindow = 30 * 24 * time.Hour
+
+// CheckinResult 是签到领取结果。
+type CheckinResult struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// UGError 是成长/商业类接口的业务错误。
+type UGError struct {
+	HTTPStatus int
+	Code       int
+	Message    string
+	Body       string
+	Path       string
+}
+
+func (e *UGError) Error() string {
+	return fmt.Sprintf("traectl: %s HTTP %d code=%d: %s", e.Path, e.HTTPStatus, e.Code, e.Message)
+}
+
+func isNumericDeviceID(s string) bool {
+	if len(s) < 10 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func randomNumericDeviceID() string {
+	var n uint64
+	if err := binary.Read(rand.Reader, binary.BigEndian, &n); err != nil {
+		n = uint64(time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%016d", n%10000000000000000)
+}
+
+func ugRequestBody(path string) []byte {
+	switch path {
+	case pathCheckinStatus, pathCheckinClaim:
+		return []byte(`{"req_source":1}`)
+	case pathEntUsage:
+		return []byte(`{"require_usage":true,"req_source":0}`)
+	default:
+		return []byte(`{}`)
+	}
+}
+
+// postUG 向成长/商业类端点发一次 POST。
+//
+// 鉴权头与 chat 不同：这里只需 Cloud-IDE-JWT + 数字设备 ID（见文件头注释）。
+func (s *Store) postUG(ctx context.Context, path string, out any) error {
+	return s.postUGWithRetry(ctx, path, out, true)
+}
+
+func (s *Store) postUGWithRetry(ctx context.Context, path string, out any, allowRefresh bool) error {
+	return s.postUGWithRetryDev(ctx, path, out, allowRefresh, "")
+}
+
+func (s *Store) postUGBody(ctx context.Context, path string, body []byte, out any) error {
+	return s.postUGWithRetryDevCustom(ctx, path, out, true, "", body)
+}
+
+func (s *Store) postUGWithRetryDev(ctx context.Context, path string, out any, allowRefresh bool, overrideDevID string) error {
+	return s.postUGWithRetryDevCustom(ctx, path, out, allowRefresh, overrideDevID, nil)
+}
+
+func (s *Store) postUGWithRetryDevCustom(ctx context.Context, path string, out any, allowRefresh bool, overrideDevID string, customBody []byte) error {
+	s.mu.Lock()
+	cred := s.Cred
+	deviceID := s.DeviceID
+	s.mu.Unlock()
+
+	host := strings.TrimRight(cred.Host, "/")
+	// CN 的登录引导配置会把 UG host 给成 api.trae.com.cn，但 ug/checkin_credits
+	// 家族只部署在 api.trae.cn（.com.cn 上全系 404；pay/ent 家族两个 host 都在，
+	// 所以额度刷新一直正常、唯独签到坏——极难定位）。若存量账号 host 仍指向已下线的
+	// api.trae.com.cn，自动纠偏归一到 DefaultUGHost（api.trae.cn）。
+	if host == "" || strings.Contains(strings.ToLower(host), "api.trae.com.cn") {
+		host = DefaultUGHost
+	}
+
+	devID := overrideDevID
+	if devID == "" {
+		devID = deviceID
+	}
+	if !isNumericDeviceID(devID) {
+		devID = randomNumericDeviceID()
+	}
+
+	bodyBytes := customBody
+	if len(bodyBytes) == 0 {
+		bodyBytes = ugRequestBody(path)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+path, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("traectl: 构造 %s 请求: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Cloud-IDE-JWT "+cred.Token)
+	// 注意：UG 接口的 x-device-id 是**数字设备 ID**，不是 chat 用的 sha256 派生值。
+	req.Header.Set("x-device-id", devID)
+	// 与 chat 保持一致的 UA：上游按 UA 做机器人识别，Go 默认 UA 会被拦。
+	req.Header.Set("User-Agent", defaultUserAgent)
+
+	cl := s.httpClient()
+	resp, err := cl.Do(req)
+	if err != nil {
+		closeIdleOnFailure(cl.Transport)
+		return fmt.Errorf("traectl: %s 请求失败: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized && allowRefresh {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		if rerr := s.Refresh(ctx); rerr == nil {
+			return s.postUGWithRetryDevCustom(ctx, path, out, false, overrideDevID, customBody)
+		}
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &UGError{HTTPStatus: resp.StatusCode, Body: string(body), Path: path, Message: "非 2xx"}
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return &UGError{HTTPStatus: resp.StatusCode, Body: string(body), Path: path,
+			Message: "响应不是合法 JSON"}
+	}
+	return nil
+}
+
+// isIntl 判断当前 Store 是否属于国际版。
+func (s *Store) isIntl() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Product.Edition == EditionIntl || IsIntlHost(s.Cred.Host)
+}
+
+// SkipCheckin 报告当前 Store 是否应跳过签到（国际版与 SOLO 无签到体系）。
+func (s *Store) SkipCheckin() bool {
+	return s.skipCheckin()
+}
+
+// skipCheckin 判断当前 Store 是否应跳过签到。
+//
+// 跳过条件：
+//   - 国际版账号：签到体系仅限 CN 版（客户端 `if (providerCode !== Vn.CN) throw`）。
+//   - SOLO 产品：SOLO 使用独立 function（solo_work_lite），上游没有 checkin_credits
+//     端点（实测返回 404）。Trae CN 与 SOLO CN 共享同一账号与额度池，
+//     签到积分由 trae-cn 侧领取即可，SOLO 侧重复请求只会产生无谓的 404 告警。
+func (s *Store) skipCheckin() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Product.Edition == EditionIntl || IsIntlHost(s.Cred.Host) {
+		return true
+	}
+	if s.Product.IsSOLO {
+		return true
+	}
+	return false
+}
+
+// CheckinStatus 查询签到状态。
+// 国际版 / SOLO 不支持签到，返回 Enable: false, CheckedIn: false。
+// 上游返回 404 时也视为「该账号不支持签到」（优雅降级），不当作错误。
+func (s *Store) CheckinStatus(ctx context.Context) (*CheckinStatus, error) {
+	if s.skipCheckin() {
+		return &CheckinStatus{
+			Enable:    false,
+			CheckedIn: false,
+			Code:      0,
+			Message:   "该产品无签到体系",
+		}, nil
+	}
+	var st CheckinStatus
+	if err := s.postUG(ctx, pathCheckinStatus, &st); err != nil {
+		// 上游 404 = 该账号/产品不支持 checkin_credits，视为「未开放」而非错误
+		if ue, ok := err.(*UGError); ok && ue.HTTPStatus == 404 {
+			return &CheckinStatus{
+				Enable:    false,
+				CheckedIn: false,
+				Code:      0,
+				Message:   "上游返回 404，签到接口不可用",
+			}, nil
+		}
+		return nil, err
+	}
+	if st.Code != 0 {
+		return &st, &UGError{HTTPStatus: 200, Code: st.Code, Message: st.Message, Path: pathCheckinStatus}
+	}
+	return &st, nil
+}
+
+// CheckinClaim 执行签到。
+//
+// 幂等性与频控保护：
+//   - 若遇到 9074（当前参与用户太多/排队降级），属于上游并发限流与设备级频控，
+//     采用随机退避（1~3秒抖动）+ 轮换全新 16 位数字设备号自动重试（最多 3 次）。
+//   - 上游业务码非 0 必须向外报告错误，绝不静默当作成功。
+func (s *Store) CheckinClaim(ctx context.Context) (*CheckinResult, error) {
+	if s.skipCheckin() {
+		return &CheckinResult{Code: 0, Message: "该产品无签到体系"}, nil
+	}
+	var r CheckinResult
+	s.mu.Lock()
+	devID := s.DeviceID
+	s.mu.Unlock()
+	if !isNumericDeviceID(devID) {
+		devID = randomNumericDeviceID()
+	}
+
+	maxRetries := 3
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		r = CheckinResult{}
+		if err := s.postUGWithRetryDev(ctx, pathCheckinClaim, &r, true, devID); err != nil {
+			return nil, err
+		}
+		if r.Code == 0 {
+			return &r, nil
+		}
+		// 如果遇到 9074（当前参与用户太多，属于高峰期排队/设备频控），换全新 16 位数字设备号并随机退避重试
+		if r.Code == 9074 && attempt < maxRetries {
+			devID = randomNumericDeviceID()
+			backoff := time.Duration(1000*(attempt+1)+int(time.Now().UnixNano()%1500)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
+		}
+		break
+	}
+
+	if r.Code != 0 {
+		return &r, &UGError{HTTPStatus: 200, Code: r.Code, Message: r.Message, Path: pathCheckinClaim}
+	}
+	return &r, nil
+}
+
+// EntUsage 查询额度用量。
+//
+// 国际版没有点数计费（Credits Billing）及 ide_user_ent_usage 接口（请求必定 404）。
+// 国际版账号通过调用 ide_user_pay_status(v1) 验证上游健康度，并合成无限额度结构（999999 / 0 消耗），
+// 保证控制台与测速能正确展示且选号权重不为 0。
+func (s *Store) EntUsage(ctx context.Context) (*EntUsage, error) {
+	if s.isIntl() {
+		pay, err := s.PayStatus(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// 根据 pay_status detail 中的 fast_request_per 提取快速请求数（若有）
+		total := 999999.0
+		if detail, ok := pay["detail"].(map[string]any); ok {
+			if fastReq, ok := detail["fast_request_per"].(float64); ok && fastReq > 0 {
+				// 有专属配额标识，显示合理数值
+				total = fastReq * 1000
+			}
+		}
+		return &EntUsage{
+			IsCreditsBilling: false,
+			UsageSummary: UsageSummary{
+				TotalAmount:      total,
+				ConsumedAmount:   0,
+				ConsumptionRatio: 0,
+			},
+		}, nil
+	}
+	var u EntUsage
+	if err := s.postUG(ctx, pathEntUsage, &u); err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// PayStatus 查询付费状态（原始 JSON，字段随服务端演进，不做强类型建模）。
+// CN 版走 v2，国际版走 v1（实测对齐客户端 out/main.js 实现）。
+func (s *Store) PayStatus(ctx context.Context) (map[string]any, error) {
+	path := pathPayStatus
+	if s.isIntl() {
+		path = pathPayStatusV1
+	}
+	var m map[string]any
+	if err := s.postUG(ctx, path, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// CheckinAndReport 查询状态并按需签到，返回签到后的最新状态。
+//
+// 返回 (didCheckin, status, err)：didCheckin 表示本次是否真的执行了领取。
+// 已签到时不报错 —— 这是定时任务每天都会走到的正常路径。
+func (s *Store) CheckinAndReport(ctx context.Context) (bool, *CheckinStatus, error) {
+	if s.skipCheckin() {
+		return false, &CheckinStatus{
+			Enable:    false,
+			CheckedIn: false,
+			Code:      0,
+			Message:   "该产品无签到体系",
+		}, nil
+	}
+	if s.NeedsRefresh(10 * time.Minute) {
+		_ = s.Refresh(ctx)
+	}
+	before, err := s.CheckinStatus(ctx)
+	if err != nil {
+		return false, nil, err
+	}
+	if before.CheckedIn {
+		return false, before, nil
+	}
+	if !before.Enable {
+		return false, before, nil // 该账号未开放签到
+	}
+	if _, err := s.CheckinClaim(ctx); err != nil {
+		return false, before, err
+	}
+	after, err := s.CheckinStatus(ctx)
+	if err != nil {
+		// 领取已成功，复核失败：因 claim 已经成功返回 code=0，返回 true
+		return true, before, nil
+	}
+	if !after.CheckedIn {
+		msg := after.Message
+		if msg == "" {
+			msg = "上游领取接口响应正常但复查未标记已签到（积分未变动）"
+		}
+		return false, after, &UGError{
+			HTTPStatus: 200,
+			Code:       after.Code,
+			Message:    msg,
+			Path:       pathCheckinClaim,
+		}
+	}
+	return true, after, nil
+}
+
+// creditsTimeout 是成长/商业类接口的单次超时。
+const creditsTimeout = 30 * time.Second
+
+// WithCreditsTimeout 返回带超时的 ctx（供调用方统一超时口径）。
+func WithCreditsTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, creditsTimeout)
+}

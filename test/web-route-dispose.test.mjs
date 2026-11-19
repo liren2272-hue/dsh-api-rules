@@ -28,10 +28,16 @@ function createFakeWebServer() {
   }
 }
 
-/** 新增路由时同步改这里，并补一条对应的 has 断言。 */
-const ROUTE_COUNT = 9
+/** 新增路由时同步改这里，并补一条对应的 has 断言。
+ *  13 条主路由（/api/api-rules/*，含 diag / tongji-vpn / tongji-account / upstreams /
+ *  upstreams/models / media-generate 等）+ 14 条 AIGC 卡片路由（/api/dsh-api-rules/aigc/*，
+ *  由 injectAigc(ctx) 经独立的 ctx.inject(['webServer']) 挂载，见 aigc-legacy/index.mjs::167）。
+ *  注：injectAigc 的 webServer 回调在 makeCtx 里同样交还 disposer，所以整表能被完整摘掉。 */
+const ROUTE_COUNT = 27
+const AIGC_EP = '/api/dsh-api-rules/aigc'
 /** 六条路由的完整清单：计数与清单一起维护，新增路由时两边都补。
- *  （models-sync、media-generate 均为后续新增；媒体转发见 goal-58ba6a2c。） */
+ *  （models-sync、media-generate 均为后续新增；媒体转发见 goal-58ba6a2c。
+ *   upstreams 为动态上游扩展槽 CRUD，见 goal-428024e2。） */
 const ROUTE_PATHS = [
   '/api/api-rules/accounts',
   '/api/api-rules/detail',
@@ -41,6 +47,15 @@ const ROUTE_PATHS = [
   '/api/api-rules/models-sync',
   '/api/api-rules/media-generate',
   '/api/api-rules/points',
+  '/api/api-rules/upstreams',
+  '/api/api-rules/upstreams/models',
+  '/api/api-rules/tongji-vpn',
+  '/api/api-rules/tongji-account',
+  ...[
+    'status', 'quota', 'token', 'relay', 'iam-captcha', 'iam-login',
+    'browser-login-start', 'browser-login-poll', 'browser-login-cancel',
+    'sso-url', 'login-start', 'auto-login', 'templates', 'generate',
+  ].map((entry) => `${AIGC_EP}/${entry}`),
 ]
 
 function makeCtx(webServer, disposers) {
@@ -54,6 +69,7 @@ function makeCtx(webServer, disposers) {
         assert.equal(typeof dispose, 'function', 'inject 回调必须交还 disposer，否则重载会撞重复路由')
         disposers.push(dispose)
       }
+      // 其他 inject（tools / credentials / agent/pre-step …）在假宿主里不挂载，忽略。
     },
     effect: () => {},
   }
@@ -73,10 +89,15 @@ test('inject 回调交还 disposer，重载不撞重复路由', async (t) => {
   assert.equal(webServer.table.size, ROUTE_COUNT, '七条路由应全部注册')
   for (const path of ROUTE_PATHS) assert.ok(webServer.table.has('exact ' + path), '缺路由: ' + path)
   assert.ok(webServer.table.has('exact /api/api-rules/minimax-account'), '新增的 minimax-account 路由必须注册上')
+  assert.ok(webServer.table.has('exact /api/api-rules/upstreams'), '新增的 upstreams 路由必须注册上')
+  assert.ok(webServer.table.has('exact /api/api-rules/upstreams/models'), 'upstreams/models 拉取模型路由必须注册上')
+  assert.ok(webServer.table.has('exact /api/api-rules/tongji-vpn'), '新增的 tongji-vpn 状态路由必须注册上')
 
   // 模拟 HMR：先跑旧条目的清理函数，再 apply 一次。
-  disposers[0]()
-  assert.equal(webServer.table.size, 0, 'disposer 必须把六条路由全部摘掉')
+  // 注意：主入口与 injectAigc 是两条独立的 ctx.inject(['webServer'])，所以 disposers
+  // 里有两个 disposer，必须**全摘**才能让第二遍 apply 不撞 aigc 的 status 等路由。
+  for (const dispose of disposers.splice(0)) dispose()
+  assert.equal(webServer.table.size, 0, 'disposer 必须把整表（主路由 + AIGC 卡片路由）全部摘掉')
   assert.ok(!webServer.table.has('exact /api/api-rules/minimax-account'), 'unload 后 minimax-account 路由也必须摘掉')
   assert.ok(!webServer.table.has('exact /api/api-rules/models-sync'), 'unload 后 models-sync 路由也必须摘掉')
   assert.ok(!webServer.table.has('exact /api/api-rules/media-generate'), 'unload 后 media-generate 路由也必须摘掉')
@@ -152,7 +173,8 @@ test('旧闭包 handler 也不能报旧数据：accounts 读的是实时 live �
   writeFileSync(file, JSON.stringify({ codearts: { ak: 'AK9999', sk: 'SK9999', updatedAt: 2 } }))
 
   // 第二轮：换成两条路由（模拟 patch 加了 minimax2api 之后重载）。
-  disposers[0]()
+  // 同 test1：主入口 + injectAigc 是两条独立 webServer inject，必须全摘再重跑。
+  for (const dispose of disposers.splice(0)) dispose()
   const configB = {
     port: 8788,
     routes: [

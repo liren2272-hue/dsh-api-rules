@@ -78,27 +78,6 @@
         "models": 9,
         "error": ""
       }
-    },
-    {
-      "id": "loomy2api",
-      "label": "loomy2api",
-      "needsCredential": false,
-      "credentialKind": "managed",
-      "configured": true,
-      "akHint": "",
-      "skHint": "",
-      "baseUrl": "",
-      "authorizationHint": "",
-      "adminUrl": "http://127.0.0.1:17890/panel",
-      "autoLaunched": true,
-      "updatedAt": null,
-      "models": 10,
-      "health": {
-        "checked": true,
-        "ok": true,
-        "models": 10,
-        "error": ""
-      }
     }
   ]
 }

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Tongji AIGC image / video generation",
+    "description": "Reverse-proxy the Tongji AIGC workspace (agi.tongji.edu.cn) into DSH: text-to-image, image-to-image, text-to-video and image-to-video. Log in via a browser redirect, then use the full set of host-side tools; outputs are written to disk and returned as absolute paths.",
+    "detail": "docs/USAGE.md"
+  }
+}
