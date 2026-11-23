@@ -78,11 +78,11 @@
             launch:
               # ⚠ 按本机实际路径填写：node.exe 用你 DSH runtime 里的绝对路径，
               # cwd 用本插件 vendor/officeace2api 的绝对路径。
-              command: "node.exe"
+              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
               args:
                 - "src/index.mjs"
               # config.json 按 process.cwd() 解析，必须把 cwd 指到内嵌副本根目录。
-              cwd: "vendor/officeace2api"
+              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\officeace2api"
               readyUrl: "http://127.0.0.1:7864/healthz"
               readyTimeoutMs: 30000
               readyPollMs: 500
@@ -157,7 +157,7 @@
             timeoutMs: 600000
             launch:
               # ⚠ 填你本机 cline2api 的 cline-proxy.exe 绝对路径。
-              command: "cline-proxy.exe"
+              command: "C:\\Users\\15940\\.dsh\\cline2api\\cline-proxy.exe"
               args:
                 - "-port"
                 - "3457"
@@ -224,11 +224,11 @@
             sessionHoldMs: 60000
             launch:
               # ⚠ 填你本机 CLIProxyAPI 的 cli-proxy-api.exe 与 config.yaml 绝对路径。
-              command: "cli-proxy-api.exe"
+              command: "C:\\Users\\15940\\.dsh\\cpa\\cli-proxy-api.exe"
               args:
                 - "-config"
-                - "config.yaml"
-              cwd: "."
+                - "C:\\Users\\15940\\.dsh\\cpa\\config.yaml"
+              cwd: "C:\\Users\\15940\\.dsh\\cpa"
               # CPA 没有 /health 路由（实测 404）；/v1/models 无鉴权头时回 401，
               # 但启动探活只要求「收到 HTTP 响应」，401 同样证明进程已在监听。
               readyPath: "/v1/models"
@@ -321,13 +321,13 @@
               # 经 node 启动器同时拉起「网关 + 浏览器登录 CDP bridge(:8766)」，
               # 使浏览器加账号随路由自启自停（此前只起 exe，bridge 丢失导致浏览器登录失效）。
               # ⚠ 按本机实际路径填写：node.exe 与 launch-minimax2api.mjs / cwd 都改成绝对路径。
-              command: "node.exe"
+              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
               args:
-                - "vendor/minimax2api/launch-minimax2api.mjs"
+                - "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\minimax2api\\launch-minimax2api.mjs"
                 - "-addr"
                 - "127.0.0.1:8080"
               # app.json / generated/ 按 process.cwd() 解析，必须指到内嵌副本根。
-              cwd: "vendor/minimax2api"
+              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\minimax2api"
               env:
                 MINIMAX2API_DATA: "data"
                 MINIMAX2API_ADMIN_PASSWORD: "sk-mm-local"
@@ -378,12 +378,12 @@
             label: Trae
             launch:
               # ⚠ 按本机实际路径填写：node.exe 与 launch.mjs / cwd 都改成绝对路径。
-              command: "node.exe"
+              command: "C:\\Users\\15940\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\node\\bin\\node.exe"
               args:
-                - "vendor/trae2api/launch.mjs"
+                - "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\trae2api\\launch.mjs"
                 - "-listen"
                 - "127.0.0.1:7870"
-              cwd: "vendor/trae2api"
+              cwd: "C:\\Users\\15940\\Documents\\dsh-plugins\\dsh-api-rules\\vendor\\trae2api"
               env:
                 HTTPS_PROXY: "http://127.0.0.1:10808"
                 HTTP_PROXY: "http://127.0.0.1:10808"

@@ -1,6 +1,34 @@
 # 更新日志
 
 
+## 1.0.57 — 2026-11-24
+
+### 同济 AIGC 凭据自持 + 令牌自动续期
+
+把「令牌 24 小时一过期就得人工回卡片重登」变成请求路径上的透明续期：账号密码存进插件
+自己的目录，令牌快过期时自动重登并写回；同时修掉 5 条 launch 路由的相对路径，让
+officeace2api / cline2api / CLIProxyAPI / minimax2api / trae2api 能真正按本机路径起进程。
+
+**新增**
+
+- `lib/aigc-legacy/lib/creds.js`（新建）：凭据本地存储，落在 `~/.dsh-tongji-aigc/credentials.json`。
+  明文绝不回传客户端卡片、绝不写日志、绝不进工具返回值，对外只暴露 `credStatus()` 的
+  「是否已存」与账号名；首次播种可从 `tongji-vpn.env` 复制一次，之后完全自包含。
+- `lib/aigc-legacy/lib/token-guard.js`（新建）：`ensureToken()` 自动续期——剩余超过 10 分钟
+  直接复用，快过期/已过期用存下的凭据走 IAM 重登并写回 `token.json`；无凭据、需要验证码或
+  密码错时**不阻塞**（返回旧令牌让上层照常报错），并进入 5 分钟冷却，避免每个请求都去打 IAM
+  把账号打到锁定；并发安全，同一时刻只跑一次续期。
+
+**修复**
+
+- `lib/aigc-legacy/lib/aigc/client.js`：`getToken()` 调用改为 `await this.getToken()`，配合异步续期。
+- `lib/aigc-legacy/index.mjs`：`injectAigc` 先给守卫配置（含 VPN 拨号钩子）再后台预热，不阻塞装载；
+  卡片登录成功后顺手 `writeCreds()` 落盘，以后过期可自动重登；状态端点补 `creds` / `guard` 两段。
+- `lib/aigc-legacy/lib/aigc/tools.js`：`api_aigc_health` 的 `health` / `user` / `error` 缺省值改为
+  与类型一致的空对象/空串，避免上游返回 null 时工具结果形状抖动。
+- `cordis.patch.yml`：5 条 launch 路由的 `command` / `args` / `cwd` 从相对值改成本机绝对路径，
+  相对路径下这些进程起不来。
+
 ## 1.0.56 — 2026-11-19
 
 ### 同济 nonstandard 端点下线 → 通用 media 通道 + Whisper ASR 工具
