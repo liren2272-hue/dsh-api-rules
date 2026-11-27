@@ -1,6 +1,36 @@
 # 更新日志
 
 
+## 1.0.58 — 2026-11-27
+
+### raccoon（sensenova）早停续推：修「一句话就结束对话」
+
+sn-sensenova-6-8-flash 在 OPS/PTC 模式（只有一个 run_code 入口、上下文很长）下常在正文里
+写「我读一下它们的内容来做总结。」「让我检查一下…」却不发 tool_calls，直接以
+`finish_reason: "stop"` 收尾。客户端看到的就是「只说一句话就瞬间结束对话」。这不是 CPA /
+raccoon2api 吞帧（无 stream aborted、无业务错误帧），而是模型自身的早停行为——qoder /
+minimax2api 规则包早就有「早停续推」兜底，raccoon 包一直没实现。
+
+**新增**
+
+- `lib/rules/raccoon.mjs`：实现 `isIncompleteTurn` / `incompleteTurnMessages` /
+  `maxIncompleteTurnRetries` 三个钩子（与 `qoder.mjs` 同构）。判定条件：本轮有正文、
+  **无**工具调用、有正常 `finish_reason`，且**最后一句**命中意图宣告词
+  （让我 / 我来 / 我先 / 我读 / 我看 / 我查 / 我确认 / 我检查 / 我会 / 接下来 / 下面我 /
+  现在让我 / let me / I'll / I will / I'm going to）。命中后 `lib/proxy.mjs` 已有的通用
+  续推块自动追加「请继续执行你刚才说要做的操作。」重发一次，续推响应接进同一条 SSE 流，
+  客户端无感。只看最后一句是关键：正常完整回答中间出现「让我解释一下」不会被误判续推。
+
+**测试**
+
+- `test/raccoon-incomplete-turn.test.mjs`（新增，11 项）：意图词命中 / 中间意图词但结尾是结论
+  不续推 / 有工具调用 / 断流无 finish_reason / 无正文 / meta 非对象 / 追加消息不改原数组。
+- `test/raccoon-incomplete-turn.e2e.test.mjs`（新增，8 项）：stub 上游第 1 轮只发正文 + stop，
+  断言代理续推第 2 轮并拿到 `run_code` 工具调用，且续推请求 messages 是
+  `[user, assistant, user]` 三段结构。
+- 全量测试：`raccoon` / `qoder` / `minimax2api` / `stream-abort` 等 39 个文件 0 失败；
+  `client-upstream-form.test.mjs` 的 5 项失败是改动前就存在的（已用 `git stash` 复现），与本次无关。
+
 ## 1.0.57 — 2026-11-24
 
 ### 同济 AIGC 凭据自持 + 令牌自动续期
